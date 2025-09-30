@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,12 @@ from mjlab.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 from mjlab.third_party.isaaclab.isaaclab_tasks.utils.parse_cfg import (
   load_cfg_from_registry,
+)
+from mjlab.utils.distributed import (
+  DistributedContext,
+  get_distributed_context,
+  resolve_distributed_device,
+  wait_for_path_update,
 )
 from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
@@ -32,10 +39,43 @@ class TrainConfig:
   video_interval: int = 2000
 
 
+def _prepare_log_directory(
+  log_root_path: Path,
+  ctx: DistributedContext,
+  start_time: float,
+  run_name_suffix: str,
+) -> Path:
+  """Create or retrieve the shared logging directory for all ranks."""
+
+  marker_path = log_root_path / ".latest_run"
+  if ctx.is_main_process and marker_path.exists():
+    marker_path.unlink()
+
+  if ctx.is_main_process:
+    log_dir_name = run_name_suffix
+    log_dir = log_root_path / log_dir_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(log_dir_name)
+  else:
+    wait_for_path_update(marker_path, start_time)
+    log_dir_name = marker_path.read_text().strip()
+    log_dir = log_root_path / log_dir_name
+    wait_for_path_update(log_dir, start_time)
+
+  return log_dir
+
+
 def run_train(task: str, cfg: TrainConfig) -> None:
   configure_torch_backends()
 
+  start_time = time.time()
+  ctx = get_distributed_context()
+  device = resolve_distributed_device(cfg.device, ctx)
+
   registry_name: str | None = None
+
+  log_root_path = Path("logs") / "rsl_rl" / cfg.agent.experiment_name
+  log_root_path.mkdir(parents=True, exist_ok=True)
 
   if isinstance(cfg.env, TrackingEnvCfg):
     if not cfg.registry_name:
@@ -45,23 +85,32 @@ def run_train(task: str, cfg: TrainConfig) -> None:
     registry_name = cast(str, cfg.registry_name)
     if ":" not in registry_name:
       registry_name = registry_name + ":latest"
-    import wandb
+    motion_marker = log_root_path / ".motion_file"
+    if ctx.is_main_process and motion_marker.exists():
+      motion_marker.unlink()
 
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    cfg.env.commands.motion.motion_file = str(Path(artifact.download()) / "motion.npz")
+    if ctx.is_main_process:
+      import wandb
+
+      api = wandb.Api()
+      artifact = api.artifact(registry_name)
+      motion_path = Path(artifact.download()) / "motion.npz"
+      cfg.env.commands.motion.motion_file = str(motion_path)
+      motion_marker.write_text(motion_path.as_posix())
+    else:
+      wait_for_path_update(motion_marker, start_time)
+      cfg.env.commands.motion.motion_file = motion_marker.read_text().strip()
 
   # Specify directory for logging experiments.
-  log_root_path = Path("logs") / "rsl_rl" / cfg.agent.experiment_name
-  log_root_path.resolve()
-  print(f"[INFO] Logging experiment in directory: {log_root_path}")
-  log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+  run_name_suffix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   if cfg.agent.run_name:
-    log_dir += f"_{cfg.agent.run_name}"
-  log_dir = log_root_path / log_dir
+    run_name_suffix += f"_{cfg.agent.run_name}"
+  log_dir = _prepare_log_directory(log_root_path, ctx, start_time, run_name_suffix)
+  if ctx.is_main_process:
+    print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
   env = gym.make(
-    task, cfg=cfg.env, device=cfg.device, render_mode="rgb_array" if cfg.video else None
+    task, cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video and ctx.is_main_process else None
   )
 
   resume_path = (
@@ -70,7 +119,7 @@ def run_train(task: str, cfg: TrainConfig) -> None:
     else None
   )
 
-  if cfg.video:
+  if cfg.video and ctx.is_main_process:
     video_kwargs = {
       "video_folder": os.path.join(log_dir, "videos", "train"),
       "step_trigger": lambda step: step % cfg.video_interval == 0,
@@ -87,18 +136,19 @@ def run_train(task: str, cfg: TrainConfig) -> None:
 
   if isinstance(cfg.env, TrackingEnvCfg):
     runner = MotionTrackingOnPolicyRunner(
-      env, agent_cfg, str(log_dir), cfg.device, registry_name
+      env, agent_cfg, str(log_dir), device, registry_name
     )
   else:
-    runner = VelocityOnPolicyRunner(env, agent_cfg, str(log_dir), cfg.device)
+    runner = VelocityOnPolicyRunner(env, agent_cfg, str(log_dir), device)
 
   runner.add_git_repo_to_log(__file__)
   if resume_path is not None:
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     runner.load(str(resume_path))
 
-  dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
-  dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
+  if ctx.is_main_process:
+    dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
+    dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
 
   runner.learn(
     num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
@@ -124,9 +174,10 @@ def main():
   agent_cfg = load_cfg_from_registry(chosen_task, "rl_cfg_entry_point")
   assert isinstance(agent_cfg, RslRlOnPolicyRunnerCfg)
 
+  parsed_args = list(remaining_args)
   args = tyro.cli(
     TrainConfig,
-    args=remaining_args,
+    args=parsed_args,
     default=TrainConfig(env=env_cfg, agent=agent_cfg),
     prog=sys.argv[0] + f" {chosen_task}",
     config=(
@@ -134,7 +185,7 @@ def main():
       tyro.conf.FlagConversionOff,
     ),
   )
-  del env_cfg, agent_cfg, remaining_args
+  del env_cfg, agent_cfg, remaining_args, parsed_args
 
   run_train(chosen_task, args)
 
