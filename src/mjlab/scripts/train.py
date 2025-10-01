@@ -166,21 +166,16 @@ def run_train(task: str, cfg: TrainConfig) -> None:
     task, cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video and ctx.is_main_process else None
   )
 
-  resume_path = (
-    get_checkpoint_path(log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint)
-    if cfg.agent.resume
-    else None
-  )
-
   if cfg.video and ctx.is_main_process:
-    video_kwargs = {
-      "video_folder": os.path.join(log_dir, "videos", "train"),
-      "step_trigger": lambda step: step % cfg.video_interval == 0,
-      "video_length": cfg.video_length,
-      "disable_logger": True,
-    }
+    env = gym.wrappers.RecordVideo(
+      env,
+      video_folder=os.path.join(log_dir, "videos", "train"),
+      step_trigger=lambda step: step % cfg.video_interval == 0,
+      video_length=cfg.video_length,
+      disable_logger=True,
+    )
+
     print("[INFO] Recording videos during training.")
-    env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
   env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
 
