@@ -44,25 +44,71 @@ def _prepare_log_directory(
   ctx: DistributedContext,
   start_time: float,
   run_name_suffix: str,
-) -> Path:
-  """Create or retrieve the shared logging directory for all ranks."""
+  should_resume: bool,
+  load_run_pattern: str,
+  load_checkpoint_pattern: str,
+) -> tuple[Path, Path | None]:
+  """Create or retrieve the shared logging directory for all ranks.
+
+  When resuming training, the resolved checkpoint path must remain identical
+  across every process. The main rank resolves the checkpoint once and writes
+  the selected run/checkpoint information to synchronisation markers that the
+  remaining ranks wait on. This avoids races where a freshly created log
+  directory would otherwise change the regex resolution order for
+  ``get_checkpoint_path``.
+  """
 
   marker_path = log_root_path / ".latest_run"
-  if ctx.is_main_process and marker_path.exists():
-    marker_path.unlink()
+  resume_marker_path = log_root_path / ".latest_checkpoint"
+  resume_path: Path | None = None
 
   if ctx.is_main_process:
-    log_dir_name = run_name_suffix
-    log_dir = log_root_path / log_dir_name
-    log_dir.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(log_dir_name)
+    if marker_path.exists():
+      marker_path.unlink()
+    if resume_marker_path.exists():
+      resume_marker_path.unlink()
+
+    if should_resume:
+      resume_path = get_checkpoint_path(
+        log_root_path,
+        load_run_pattern,
+        load_checkpoint_pattern,
+      )
+      log_dir = resume_path.parent
+      if not log_dir.exists():
+        raise FileNotFoundError(
+          f"Resolved resume directory '{log_dir}' does not exist for rank {ctx.global_rank}."
+        )
+      marker_path.write_text(log_dir.name)
+      resume_marker_path.write_text(resume_path.as_posix())
+    else:
+      log_dir_name = run_name_suffix
+      log_dir = log_root_path / log_dir_name
+      log_dir.mkdir(parents=True, exist_ok=True)
+      marker_path.write_text(log_dir_name)
   else:
     wait_for_path_update(marker_path, start_time)
     log_dir_name = marker_path.read_text().strip()
     log_dir = log_root_path / log_dir_name
-    wait_for_path_update(log_dir, start_time)
+    if should_resume:
+      wait_for_path_update(resume_marker_path, start_time)
+      resume_path = Path(resume_marker_path.read_text().strip())
+      if not log_dir.exists():
+        raise FileNotFoundError(
+          f"Resolved resume directory '{log_dir}' does not exist for rank {ctx.global_rank}."
+        )
+    else:
+      wait_for_path_update(log_dir, start_time)
 
-  return log_dir
+  if should_resume and resume_path is None:
+    raise RuntimeError(
+      "Failed to resolve a checkpoint path for resuming training; "
+      f"rank {ctx.global_rank} did not receive synchronised metadata."
+    )
+
+  return log_dir, resume_path
+
+
 
 
 def run_train(task: str, cfg: TrainConfig) -> None:
@@ -101,11 +147,18 @@ def run_train(task: str, cfg: TrainConfig) -> None:
       wait_for_path_update(motion_marker, start_time)
       cfg.env.commands.motion.motion_file = motion_marker.read_text().strip()
 
-  # Specify directory for logging experiments.
   run_name_suffix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   if cfg.agent.run_name:
     run_name_suffix += f"_{cfg.agent.run_name}"
-  log_dir = _prepare_log_directory(log_root_path, ctx, start_time, run_name_suffix)
+  log_dir, resume_path = _prepare_log_directory(
+    log_root_path,
+    ctx,
+    start_time,
+    run_name_suffix,
+    cfg.agent.resume,
+    cfg.agent.load_run,
+    cfg.agent.load_checkpoint,
+  )
   if ctx.is_main_process:
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
