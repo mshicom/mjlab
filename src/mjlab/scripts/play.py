@@ -1,5 +1,6 @@
 """Script to play RL agent with RSL-RL."""
 
+from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Literal, cast
@@ -22,6 +23,62 @@ from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserViewer
 
 
+def _prepare_policy_state_dict(
+  policy_state: OrderedDict[str, torch.Tensor], model_state: OrderedDict[str, torch.Tensor]
+) -> OrderedDict[str, torch.Tensor]:
+  """Prepare a checkpoint state dict so it matches the current policy structure.
+
+  This adds forward compatibility between checkpoints saved with ``log_std`` parameters
+  (older RSL-RL versions) and policies that expect ``std`` (newer configs), and vice versa.
+  """
+
+  converted_state = model_state.copy()
+
+  has_policy_std = "std" in policy_state
+  has_policy_log_std = "log_std" in policy_state
+  has_checkpoint_std = "std" in converted_state
+  has_checkpoint_log_std = "log_std" in converted_state
+
+  if has_policy_std and not has_checkpoint_std and has_checkpoint_log_std:
+    log_std_param = converted_state.pop("log_std")
+    std_ref = policy_state["std"]
+    converted_state["std"] = torch.exp(log_std_param).to(dtype=std_ref.dtype, device=std_ref.device)
+    print("[INFO]: Converted checkpoint parameter 'log_std' -> 'std'.")
+  elif has_policy_log_std and not has_checkpoint_log_std and has_checkpoint_std:
+    std_param = converted_state.pop("std")
+    log_std_ref = policy_state["log_std"]
+    std_safe = torch.clamp(std_param, min=1e-8)
+    converted_state["log_std"] = torch.log(std_safe).to(
+      dtype=log_std_ref.dtype, device=log_std_ref.device
+    )
+    print("[INFO]: Converted checkpoint parameter 'std' -> 'log_std'.")
+
+  return converted_state
+
+
+def _load_policy_checkpoint(
+  runner: OnPolicyRunner, checkpoint_path: Path, device: str
+) -> tuple[dict | None, int | None]:
+  """Load a policy checkpoint with backward-compatible parameter handling."""
+
+  checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+  if "model_state_dict" not in checkpoint:
+    raise KeyError("Checkpoint does not contain 'model_state_dict'.")
+
+  policy_state = runner.alg.policy.state_dict()
+  converted_state = _prepare_policy_state_dict(policy_state, checkpoint["model_state_dict"])
+  runner.alg.policy.load_state_dict(converted_state, strict=True)
+
+  # Keep track of iteration for logging, though it's unused in play mode.
+  iteration = checkpoint.get("iter")
+  infos = checkpoint.get("infos")
+
+  # Ensure policy tensors are on the requested device when we run inference later.
+  runner.alg.policy.to(device)
+
+  return infos, iteration
+
+
 def run_play(
   task: str,
   wandb_run_path: str | None = None,
@@ -35,7 +92,7 @@ def run_play(
   video_width: int | None = None,
   camera: int | str | None = None,
   render_all_envs: bool = False,
-  viewer: Literal["native", "viser"] = "native",
+  viewer: Literal["native", "viser", "none"] = "native",
 ):
   configure_torch_backends()
 
@@ -110,7 +167,8 @@ def run_play(
     )
   else:
     runner = OnPolicyRunner(env, asdict(agent_cfg), log_dir=str(log_dir), device=device)
-  runner.load(str(resume_path), map_location=device)
+
+  _load_policy_checkpoint(runner, resume_path, device)
 
   policy = runner.get_inference_policy(device=device)
 
@@ -118,6 +176,8 @@ def run_play(
     NativeMujocoViewer(env, policy, render_all_envs=render_all_envs).run()
   elif viewer == "viser":
     ViserViewer(env, policy, render_all_envs=render_all_envs).run()
+  elif viewer == "none":
+    print("[INFO]: Viewer disabled; exiting after policy load.")
   else:
     assert_never(viewer)
 
