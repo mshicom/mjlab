@@ -87,6 +87,7 @@ def _prepare_log_directory(
       log_dir.mkdir(parents=True, exist_ok=True)
       marker_path.write_text(log_dir_name)
   else:
+    print(f"[INFO] Rank {ctx.global_rank} waiting for log directory...")
     wait_for_path_update(marker_path, start_time)
     log_dir_name = marker_path.read_text().strip()
     log_dir = log_root_path / log_dir_name
