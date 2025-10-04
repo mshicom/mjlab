@@ -83,8 +83,23 @@ def resolve_distributed_device(requested_device: str, context: DistributedContex
   return f"cuda:{context.local_rank}"
 
 
-def wait_for_path_update(path: Path, start_time: float, poll_interval: float = 0.1) -> None:
-  """Wait until ``path`` exists and has been modified after ``start_time``.
+def wait_for_path_update(
+  path: Path,
+  start_time: float | None = None,
+  poll_interval: float = 0.1,
+  timeout: float | None = None,
+) -> None:
+  """Wait until ``path`` exists (and optionally is updated after ``start_time``).
+
+  Args:
+    path: The file or directory whose creation/update should be observed.
+    start_time: When provided, require the modification time of ``path`` to be
+      greater or equal to ``start_time`` before returning. When ``None``, any
+      existing path satisfies the wait.
+    poll_interval: Interval between existence checks, in seconds.
+    timeout: Optional wall-clock timeout in seconds. When provided, a
+      :class:`TimeoutError` is raised if the path does not meet the desired
+      condition within the allotted time.
 
   ``torchrun`` launches processes concurrently, so helper files created by the
   main rank may appear slightly later for the secondary ranks. This polling
@@ -92,8 +107,12 @@ def wait_for_path_update(path: Path, start_time: float, poll_interval: float = 0
   itself has been initialised.
   """
 
+  deadline = time.time() + timeout if timeout is not None else None
+
   while True:
     if path.exists():
+      if start_time is None:
+        return
       try:
         mtime = path.stat().st_mtime
       except FileNotFoundError:
@@ -103,4 +122,8 @@ def wait_for_path_update(path: Path, start_time: float, poll_interval: float = 0
         continue
       if mtime >= start_time:
         return
+
+    if deadline is not None and time.time() >= deadline:
+      raise TimeoutError(f"Timed out waiting for '{path}' to be created or updated.")
+
     time.sleep(poll_interval)

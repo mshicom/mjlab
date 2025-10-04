@@ -42,7 +42,6 @@ class TrainConfig:
 def _prepare_log_directory(
   log_root_path: Path,
   ctx: DistributedContext,
-  start_time: float,
   run_name_suffix: str,
   should_resume: bool,
   load_run_pattern: str,
@@ -86,20 +85,21 @@ def _prepare_log_directory(
       log_dir = log_root_path / log_dir_name
       log_dir.mkdir(parents=True, exist_ok=True)
       marker_path.write_text(log_dir_name)
+    time.sleep(0.1)
   else:
     print(f"[INFO] Rank {ctx.global_rank} waiting for log directory...")
-    wait_for_path_update(marker_path, start_time)
+    wait_for_path_update(marker_path, timeout=120)
     log_dir_name = marker_path.read_text().strip()
     log_dir = log_root_path / log_dir_name
     if should_resume:
-      wait_for_path_update(resume_marker_path, start_time)
+      wait_for_path_update(resume_marker_path, timeout=120)
       resume_path = Path(resume_marker_path.read_text().strip())
       if not log_dir.exists():
         raise FileNotFoundError(
           f"Resolved resume directory '{log_dir}' does not exist for rank {ctx.global_rank}."
         )
     else:
-      wait_for_path_update(log_dir, start_time)
+      wait_for_path_update(log_dir, timeout=120)
 
   if should_resume and resume_path is None:
     raise RuntimeError(
@@ -115,7 +115,6 @@ def _prepare_log_directory(
 def run_train(task: str, cfg: TrainConfig) -> None:
   configure_torch_backends()
 
-  start_time = time.time()
   ctx = get_distributed_context()
   device = resolve_distributed_device(cfg.device, ctx)
 
@@ -145,7 +144,7 @@ def run_train(task: str, cfg: TrainConfig) -> None:
       cfg.env.commands.motion.motion_file = str(motion_path)
       motion_marker.write_text(motion_path.as_posix())
     else:
-      wait_for_path_update(motion_marker, start_time)
+      wait_for_path_update(motion_marker, timeout=120)
       cfg.env.commands.motion.motion_file = motion_marker.read_text().strip()
 
   run_name_suffix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -154,7 +153,6 @@ def run_train(task: str, cfg: TrainConfig) -> None:
   log_dir, resume_path = _prepare_log_directory(
     log_root_path,
     ctx,
-    start_time,
     run_name_suffix,
     cfg.agent.resume,
     cfg.agent.load_run,
