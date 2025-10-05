@@ -190,17 +190,28 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 )
 
 KNEES_BENT_KEYFRAME = EntityCfg.InitialStateCfg(
-  pos=(0, 0, 1.0342),
+  pos=(0, 0, 1.01049855),
+  rot=(0.99996085, 0.00063051, 0.00831705, -0.00295396),
   joint_pos={
-    "left_hip_pitch_joint": 0.2792526803190927,
-    "right_hip_pitch_joint": -0.2792526803190927,
-    ".*_knee_joint": 0.5585053606381855,
-    "left_ankle_pitch_joint": 0.2792526803190927,
-    "right_ankle_pitch_joint": -0.2792526803190927,
-    ".*_elbow_joint": 0.6,
-    ".*_shoulder_pitch_joint": 0,
-    "left_shoulder_roll_joint": 0.33161255787892263,
-    "right_shoulder_roll_joint": -0.33161255787892263,
+    "left_hip_pitch_joint": 0.32852522,
+    "left_hip_roll_joint": -0.00008073,
+    "left_hip_yaw_joint":0.00621187,
+    "left_knee_joint": 0.68751394,
+    "left_ankle_pitch_joint": 0.37540821,
+    "left_ankle_roll_joint": 0.00075587,
+    
+    "right_hip_pitch_joint": 0.33181301,
+    "right_hip_roll_joint": -0.00007851,
+    "right_hip_yaw_joint": 0.00599928,
+    "right_knee_joint": 0.69000456,
+    "right_ankle_pitch_joint": 0.37461314,
+    "right_ankle_roll_joint": 0.00069042, 
+     
+    ".*_shoulder_pitch_joint": -0.10415088,
+    ".*_shoulder_roll_joint": 0.26102581,
+    ".*_shoulder_yaw_joint": -0.00434672,
+    ".*_elbow_joint": 0.96020388,
+    ".*_wrist_roll_joint": -0.00645714,
   },
   joint_vel={".*": 0.0},
 )
