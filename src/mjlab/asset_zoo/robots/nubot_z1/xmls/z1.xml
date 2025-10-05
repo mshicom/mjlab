@@ -21,6 +21,9 @@ Modified by Kaihong 2025
   </default>
 
   <asset>
+    <material name="silver" rgba="0.7 0.7 0.7 1"/>
+    <material name="black" rgba="0.2 0.2 0.2 1"/>
+
     <mesh file="base_link.STL" name="base_link" />
     <mesh file="left_hip_pitch_link.STL" name="left_hip_pitch_link" />
     <mesh file="left_hip_roll_link.STL" name="left_hip_roll_link" />
@@ -49,6 +52,7 @@ Modified by Kaihong 2025
   </asset>
 
   <worldbody>
+    <!-- <geom name="floor" size="0 0 0.01" type="plane"/> -->
     <body name="pelvis" pos="0 0 1.07" childclass="z1">
       <light pos="0 0 2" mode="trackcom"/>
       <camera name="tracking" pos="1.734 -1.135 .35" xyaxes="0.552 0.834 -0.000 -0.170 0.112 0.979" mode="trackcom"/>
@@ -87,13 +91,12 @@ Modified by Kaihong 2025
                 <geom class="visual" mesh="left_ankle_pitch_link" />
                 
                 <body name="left_ankle_roll_link" pos="0.05825 -0.02575 0">
-                  <site name="left_foot" type="box" pos="-0.021728 -0.00218003 -0.0515" quat="1 0 0 0" size="0.141747 0.055274 0.0125"/>
+                  <site name="left_foot" type="box" pos="-0.0202531 -0.00218003 -0.022" quat="0.5 -0.5 0.5 -0.5" size="0.055274 0.042 0.147997"/>
                   <inertial diaginertia="0.0110231 0.00950979 0.00300129" mass="1.083" pos="-0.010156 -0.0034812 -0.043019" quat="0.540217 0.477876 0.517409 0.460531" />
                   <joint name="left_ankle_roll_joint" axis="1 0 0" range="-0.17 0.17"  actuatorfrcrange="-90 90"/>
                   <geom class="visual" mesh="left_ankle_roll_link"/>
   
-                  <geom class="collision" name="left_foot1_collision" type="box" pos="-0.021728 -0.00218003 -0.0515" quat="1 0 0 0" size="0.141747 0.055274 0.0125"/>
-
+                  <geom class="collision" name="left_foot1_collision" type="box" pos="-0.0202531 -0.00218003 -0.022" quat="0.5 -0.5 0.5 -0.5" size="0.055274 0.042 0.147997"/>
                 </body>
               </body>
             </body>
@@ -130,12 +133,13 @@ Modified by Kaihong 2025
                 <geom class="visual" mesh="right_ankle_pitch_link"  />
                 
                 <body name="right_ankle_roll_link" pos="0.05825 0.02575 0">
-                  <site name="right_foot" class="collision" type="box" pos="-0.021728 0.00218003 -0.0515" quat="1 0 0 0" size="0.141747 0.055274 0.0125"/>
+                  <site name="right_foot" class="collision"  type="box" pos="-0.0202531 0.00218003 -0.022" quat="0.5 0.5 0.5 0.5" size="0.055274 0.042 0.147997"/>
                   <inertial diaginertia="0.0110231 0.00950979 0.00300129" mass="1.083" pos="-0.010158 0.0034812 -0.043018" quat="0.460531 0.517409 0.477876 0.540217" />
                   <joint name="right_ankle_roll_joint" axis="1 0 0" range="-0.17 0.17"  actuatorfrcrange="-90 90"/>
                   <geom class="visual" mesh="right_ankle_roll_link" />
                   
-                  <geom class="collision" name="right_foot1_collision" type="box" pos="-0.021728 0.00218003 -0.0515" quat="1 0 0 0" size="0.141747 0.055274 0.0125"/>
+                  <geom class="collision" name="right_foot1_collision" type="box" pos="-0.0202531 0.00218003 -0.022" quat="0.5 0.5 0.5 0.5" size="0.055274 0.042 0.147997"/>
+
                 </body>
               </body>
             </body>

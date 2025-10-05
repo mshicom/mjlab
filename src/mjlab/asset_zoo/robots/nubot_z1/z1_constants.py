@@ -89,7 +89,7 @@ ACTUATOR_13720_11 = ElectricActuator(
   effort_limit=400,
 )
 
-NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10Hz
+NATURAL_FREQ = 50 * 2.0 * 3.1415926535  # 50Hz (increased from 10Hz to fix action scale)
 DAMPING_RATIO = 2.0
 
 STIFFNESS_4310_P2_36 = ARMATURE_4310_P2_36 * NATURAL_FREQ**2
