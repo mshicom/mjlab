@@ -88,8 +88,8 @@ class RslRlBaseRunnerCfg:
   """The wandb project name."""
   resume: bool = False
   """Whether to resume the experiment. Default is False."""
-  load_run: str = ".*"
-  """The run directory to load. Default is ".*" which means all runs. If regex
+  load_run: str = r"(?!wandb_checkpoints).+"
+  """The run directory to load. Default is "(?!wandb_checkpoints).+" which means all runs (except wandb_checkpoints). If regex
   expression, the latest (alphabetical order) matching run will be loaded.
   """
   load_checkpoint: str = "model_.*.pt"
