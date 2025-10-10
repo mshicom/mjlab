@@ -1,24 +1,11 @@
-# Copyright (c) 2021-2024, The RSL-RL Project Developers.
-# All rights reserved.
-# Original code is licensed under the BSD-3-Clause license.
-#
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
-# Copyright (c) 2025-2026, The Legged Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
-# All rights reserved.
-# Modifications are licensed under the BSD-3-Clause license.
-#
-# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
-# with additional modifications by the TienKung-Lab Project,
-# and is distributed under the BSD-3-Clause license.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """Implementation of runners for environment-agent interaction."""
 
-from .amp_on_policy_runner import AmpOnPolicyRunner
-from .on_policy_runner import OnPolicyRunner
+from .on_policy_runner import OnPolicyRunner  # isort:skip
+from .distillation_runner import DistillationRunner
 
-__all__ = ["OnPolicyRunner", "AmpOnPolicyRunner"]
+__all__ = ["OnPolicyRunner", "DistillationRunner"]

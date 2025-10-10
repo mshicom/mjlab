@@ -1,21 +1,3 @@
-# Copyright (c) 2021-2024, The RSL-RL Project Developers.
-# All rights reserved.
-# Original code is licensed under the BSD-3-Clause license.
-#
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The Legged Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
-# All rights reserved.
-# Modifications are licensed under the BSD-3-Clause license.
-#
-# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
-# with additional modifications by the TienKung-Lab Project,
-# and is distributed under the BSD-3-Clause license.
-
 from __future__ import annotations
 
 import os
@@ -32,7 +14,6 @@ from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
     Discriminator,
-    EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
 )
@@ -40,7 +21,7 @@ from rsl_rl.utils import AMPLoader, Normalizer, store_code_state
 
 
 class AmpOnPolicyRunner:
-    """On-policy runner for training and evaluation."""
+    """On-policy runner for AMP training and evaluation (v3.1.0-style API)."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
@@ -52,7 +33,7 @@ class AmpOnPolicyRunner:
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
 
-        # resolve training type depending on the algorithm
+        # training type
         if self.alg_cfg["class_name"] in ["PPO", "AMPPPO"]:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
@@ -60,53 +41,38 @@ class AmpOnPolicyRunner:
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
-
-        # resolve type of privileged observations
-        if self.training_type == "rl":
-            if "critic" in extras["observations"]:
-                self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
-            else:
-                self.privileged_obs_type = None
-        if self.training_type == "distillation":
-            if "teacher" in extras["observations"]:
-                self.privileged_obs_type = "teacher"  # policy distillation
-            else:
-                self.privileged_obs_type = None
-
-        # resolve dimensions of privileged observations
-        if self.privileged_obs_type is not None:
-            num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
+        # observations from environment (TensorDict in 3.1.0)
+        obs = self.env.get_observations()
+        # obs groups mapping (3.1.0). If not provided, default to policy->['policy'], critic->['policy','privileged'] when available.
+        if "obs_groups" in self.cfg:
+            obs_groups = self.cfg["obs_groups"]
         else:
-            num_privileged_obs = num_obs
+            # Backwards-compatible default mapping
+            obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+            # If a privileged group exists, include it for critic
+            if isinstance(obs, dict):
+                if "privileged" in obs:
+                    obs_groups["critic"] = ["policy", "privileged"]
+            else:
+                # TensorDict case
+                try:
+                    if "privileged" in obs.keys():
+                        obs_groups["critic"] = ["policy", "privileged"]
+                except Exception:
+                    pass
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            obs, obs_groups, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
-
-        # resolve dimension of rnd gated state
-        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
-            # check if rnd gated state is present
-            rnd_state = extras["observations"].get("rnd_state")
-            if rnd_state is None:
-                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
-            # get dimension of rnd gated state
-            num_rnd_state = rnd_state.shape[1]
-            # add rnd gated state to config
-            self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
-            # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
-            self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
 
         # if using symmetry then pass the environment config object
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # init amp loader
+        # init amp loader and components
         amp_data = AMPLoader(
             device,
             time_between_frames=self.env.step_dt,
@@ -140,28 +106,17 @@ class AmpOnPolicyRunner:
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
-        self.empirical_normalization = self.cfg["empirical_normalization"]
-        if self.empirical_normalization:
-            self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
-            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
-                self.device
-            )
-        else:
-            self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
-            self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
-        # init storage and model
+        # init storage (3.1.0 signature)
         self.alg.init_storage(
             self.training_type,
             self.env.num_envs,
             self.num_steps_per_env,
-            [num_obs],
-            [num_privileged_obs],
+            obs,
             [self.env.num_actions],
         )
 
         # Decide whether to disable logging
-        # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
         # Logging
         self.log_dir = log_dir
@@ -175,8 +130,7 @@ class AmpOnPolicyRunner:
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
-            self.logger_type = self.cfg.get("logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
+            self.logger_type = self.cfg.get("logger", "tensorboard").lower()
 
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
@@ -206,10 +160,9 @@ class AmpOnPolicyRunner:
             )
 
         # start learning
-        obs, extras = self.env.get_observations()
-        privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        obs = self.env.get_observations()
         amp_obs = self.env.get_amp_obs_for_expert_trans()
-        obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
+        obs, amp_obs = obs.to(self.device), amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -230,8 +183,6 @@ class AmpOnPolicyRunner:
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
-            # TODO: Do we need to synchronize empirical normalizers?
-            #   Right now: No, because they all should converge to the same values "asymptotically".
 
         # Start training
         start_iter = self.current_learning_iteration
@@ -242,9 +193,9 @@ class AmpOnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs, amp_obs)
-                    # Step the environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    actions = self.alg.act(obs, amp_obs)
+                    # Step the environment (3.1.0: returns obs TD, rewards, dones, extras)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     next_amp_obs = self.env.get_amp_obs_for_expert_trans()
                     # Move to device
                     obs, rewards, dones, next_amp_obs = (
@@ -253,36 +204,31 @@ class AmpOnPolicyRunner:
                         dones.to(self.device),
                         next_amp_obs.to(self.device),
                     )
-                    # perform normalization
-                    obs = self.obs_normalizer(obs)
-                    if self.privileged_obs_type is not None:
-                        privileged_obs = self.privileged_obs_normalizer(
-                            infos["observations"][self.privileged_obs_type].to(self.device)
-                        )
-                    else:
-                        privileged_obs = obs
 
-                    # Account for terminal state transitions
+                    # Account for terminal state transitions for AMP transitions
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
                     reset_env_ids = self.env.reset_env_ids
                     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
 
+                    # Replace task rewards with AMP reward (optionally lerped in discriminator)
                     rewards = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
                     )[0]
                     amp_obs = torch.clone(next_amp_obs)
-                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
+
+                    # Process env step in algorithm (3.1.0 signature)
+                    self.alg.process_env_step(obs, rewards, dones, extras, next_amp_obs_with_term)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
                     # book keeping
                     if self.log_dir is not None:
-                        if "episode" in infos:
-                            ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
+                        if "episode" in extras:
+                            ep_infos.append(extras["episode"])
+                        elif "log" in extras:
+                            ep_infos.append(extras["log"])
                         # Update rewards
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
@@ -293,7 +239,6 @@ class AmpOnPolicyRunner:
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
-                        # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -312,7 +257,7 @@ class AmpOnPolicyRunner:
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs)
+                    self.alg.compute_returns(obs)
 
             # update policy
             loss_dict = self.alg.update()
@@ -464,10 +409,6 @@ class AmpOnPolicyRunner:
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-        # -- Save observation normalizer if used
-        if self.empirical_normalization:
-            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
-            saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
 
         # save model
         torch.save(saved_dict, path)
@@ -485,18 +426,6 @@ class AmpOnPolicyRunner:
         # -- Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        # -- Load observation normalizer if used
-        if self.empirical_normalization:
-            if resumed_training:
-                # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
-                # and the critic/teacher normalizer is loaded for the critic/teacher
-                self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
-            else:
-                # if the training is not resumed but a model is loaded, this run must be distillation training following
-                # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
-                # is not loaded, as the observation space could differ from the previous rl training.
-                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
         # -- load optimizer if used
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
@@ -513,12 +442,8 @@ class AmpOnPolicyRunner:
         self.eval_mode()  # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.policy.to(device)
-        policy = self.alg.policy.act_inference
-        if self.cfg["empirical_normalization"]:
-            if device is not None:
-                self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
-        return policy
+        # policy handles normalization internally in 3.1.0
+        return self.alg.policy.act_inference
 
     def train_mode(self):
         # -- PPO
@@ -527,10 +452,6 @@ class AmpOnPolicyRunner:
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.train()
-        # -- Normalization
-        if self.empirical_normalization:
-            self.obs_normalizer.train()
-            self.privileged_obs_normalizer.train()
 
     def eval_mode(self):
         # -- PPO
@@ -539,10 +460,6 @@ class AmpOnPolicyRunner:
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.eval()
-        # -- Normalization
-        if self.empirical_normalization:
-            self.obs_normalizer.eval()
-            self.privileged_obs_normalizer.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)

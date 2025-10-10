@@ -1,22 +1,9 @@
-# Copyright (c) 2021-2024, The RSL-RL Project Developers.
-# All rights reserved.
-# Original code is licensed under the BSD-3-Clause license.
-#
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #
-# Copyright (c) 2025-2026, The Legged Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
-# All rights reserved.
-# Modifications are licensed under the BSD-3-Clause license.
-#
-# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
-# with additional modifications by the TienKung-Lab Project,
-# and is distributed under the BSD-3-Clause license.
+# SPDX-License-Identifier: BSD-3-Clause
 
-#  Copyright (c) 2020 Preferred Networks, Inc.
+# Copyright (c) 2020 Preferred Networks, Inc.
 
 from __future__ import annotations
 
@@ -33,8 +20,10 @@ class EmpiricalNormalization(nn.Module):
         Args:
             shape (int or tuple of int): Shape of input values except batch axis.
             eps (float): Small value for stability.
-            until (int or None): If this arg is specified, the link learns input values until the sum of batch sizes
+            until (int or None): If this arg is specified, the module learns input values until the sum of batch sizes
             exceeds it.
+
+        Note: The normalization parameters are computed over the whole batch, not for each environment separately.
         """
         super().__init__()
         self.eps = eps
@@ -53,30 +42,22 @@ class EmpiricalNormalization(nn.Module):
         return self._std.squeeze(0).clone()
 
     def forward(self, x):
-        """Normalize mean and variance of values based on empirical values.
+        """Normalize mean and variance of values based on empirical values."""
 
-        Args:
-            x (ndarray or Variable): Input values
-
-        Returns:
-            ndarray or Variable: Normalized output values
-        """
-
-        if self.training:
-            self.update(x)
         return (x - self._mean) / (self._std + self.eps)
 
     @torch.jit.unused
     def update(self, x):
         """Learn input values without computing the output values of them"""
 
+        if not self.training:
+            return
         if self.until is not None and self.count >= self.until:
             return
 
         count_x = x.shape[0]
         self.count += count_x
         rate = count_x / self.count
-
         var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
         mean_x = torch.mean(x, dim=0, keepdim=True)
         delta_mean = mean_x - self._mean
@@ -86,6 +67,8 @@ class EmpiricalNormalization(nn.Module):
 
     @torch.jit.unused
     def inverse(self, y):
+        """De-normalize values based on empirical values."""
+
         return y * (self._std + self.eps) + self._mean
 
 
@@ -101,23 +84,28 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
         super().__init__()
 
         self.emp_norm = EmpiricalNormalization(shape, eps, until)
-        self.disc_avg = DiscountedAverage(gamma)
+        self.disc_avg = _DiscountedAverage(gamma)
 
     def forward(self, rew):
         if self.training:
-            # update discounected rewards
+            # update discounted rewards
             avg = self.disc_avg.update(rew)
-
             # update moments from discounted rewards
             self.emp_norm.update(avg)
 
+        # normalize rewards with the empirical std
         if self.emp_norm._std > 0:
             return rew / self.emp_norm._std
         else:
             return rew
 
 
-class DiscountedAverage:
+"""
+Helper class.
+"""
+
+
+class _DiscountedAverage:
     r"""Discounted average of rewards.
 
     The discounted average is defined as:

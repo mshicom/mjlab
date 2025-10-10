@@ -1,21 +1,3 @@
-# Copyright (c) 2021-2024, The RSL-RL Project Developers.
-# All rights reserved.
-# Original code is licensed under the BSD-3-Clause license.
-#
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The Legged Lab Project Developers.
-# All rights reserved.
-#
-# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
-# All rights reserved.
-# Modifications are licensed under the BSD-3-Clause license.
-#
-# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
-# with additional modifications by the TienKung-Lab Project,
-# and is distributed under the BSD-3-Clause license.
-
 from __future__ import annotations
 
 from itertools import chain
@@ -44,17 +26,18 @@ class AMPPPO:
         amp_normalizer,
         amp_replay_buffer_size=100000,
         min_std=None,
-        num_learning_epochs=1,
-        num_mini_batches=1,
+        # PPO params (use 3.1.0 defaults unless overridden)
+        num_learning_epochs=5,
+        num_mini_batches=4,
         clip_param=0.2,
-        gamma=0.998,
+        gamma=0.99,
         lam=0.95,
         value_loss_coef=1.0,
-        entropy_coef=0.0,
+        entropy_coef=0.01,
         learning_rate=1e-3,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
-        schedule="fixed",
+        schedule="adaptive",
         desired_kl=0.01,
         device="cpu",
         normalize_advantage_per_mini_batch=False,
@@ -76,13 +59,12 @@ class AMPPPO:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # RND components
+        # RND components (match 3.1.0 usage)
         if rnd_cfg is not None:
-            # Create RND module
+            # Extract parameters used here to avoid passing them twice
+            rnd_lr = rnd_cfg.pop("learning_rate", 1e-3)
             self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
-            # Create RND optimizer
-            params = self.rnd.predictor.parameters()
-            self.rnd_optimizer = optim.Adam(params, lr=rnd_cfg.get("learning_rate", 1e-3))
+            self.rnd_optimizer = optim.Adam(self.rnd.predictor.parameters(), lr=rnd_lr)
         else:
             self.rnd = None
             self.rnd_optimizer = None
@@ -147,42 +129,37 @@ class AMPPPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
-    def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
-    ):
-        # create memory for RND as well :)
-        if self.rnd:
-            rnd_state_shape = [self.rnd.num_states]
-        else:
-            rnd_state_shape = None
-        # create rollout storage
+    def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
+        # create rollout storage (3.1.0 signature: obs is a TensorDict / obs-groups)
         self.storage = RolloutStorage(
             training_type,
             num_envs,
             num_transitions_per_env,
-            actor_obs_shape,
-            critic_obs_shape,
+            obs,
             actions_shape,
-            rnd_state_shape,
             self.device,
         )
 
-    def act(self, obs, critic_obs, amp_obs):
+    def act(self, obs, amp_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
         self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
-        # need to record obs and critic_obs before env.step()
+        # record observations prior to env.step()
         self.transition.observations = obs
-        self.transition.privileged_observations = critic_obs
         self.amp_transition.observations = amp_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, amp_obs):
+    def process_env_step(self, obs, rewards, dones, extras, amp_obs):
+        # Update normalization for policy (and RND if present)
+        self.policy.update_normalization(obs)
+        if self.rnd:
+            self.rnd.update_normalization(obs)
+
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -190,20 +167,14 @@ class AMPPPO:
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # Obtain curiosity gates / observations from infos
-            rnd_state = infos["observations"]["rnd_state"]
-            # Compute the intrinsic rewards
-            # note: rnd_state is the gated_state after normalization if normalization is used
-            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # Add intrinsic rewards to extrinsic rewards
+            # 3.1.0: intrinsic rewards are computed from obs directly
+            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             self.transition.rewards += self.intrinsic_rewards
-            # Record the curiosity gates
-            self.transition.rnd_state = rnd_state.clone()
 
         # Bootstrapping on time outs
-        if "time_outs" in infos:
+        if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
+                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
         # record the transition
@@ -213,9 +184,9 @@ class AMPPPO:
         self.amp_transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self, last_critic_obs):
+    def compute_returns(self, obs):
         # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
+        last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -258,7 +229,6 @@ class AMPPPO:
         for sample, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
             (
                 obs_batch,
-                critic_obs_batch,
                 actions_batch,
                 target_values_batch,
                 advantages_batch,
@@ -268,14 +238,13 @@ class AMPPPO:
                 old_sigma_batch,
                 hid_states_batch,
                 masks_batch,
-                rnd_state_batch,
             ) = sample
 
             # number of augmentations per sample
             # we start with 1 and increase it if we use symmetry augmentation
             num_aug = 1
             # original batch size
-            original_batch_size = obs_batch.shape[0]
+            original_batch_size = obs_batch.batch_size[0] if hasattr(obs_batch, "batch_size") else obs_batch.shape[0]
 
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -286,15 +255,13 @@ class AMPPPO:
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
-                # returned shape: [batch_size * num_aug, ...]
-                obs_batch, actions_batch = data_augmentation_func(
-                    obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
-                )
-                critic_obs_batch, _ = data_augmentation_func(
-                    obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
-                )
+                # returned obs shape should be [batch_size * num_aug, ...] for policy inputs
+                obs_batch, actions_batch = data_augmentation_func(obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"])
                 # compute number of augmentations per sample
-                num_aug = int(obs_batch.shape[0] / original_batch_size)
+                num_aug = int(
+                    (obs_batch.batch_size[0] if hasattr(obs_batch, "batch_size") else obs_batch.shape[0])
+                    / original_batch_size
+                )
                 # repeat the rest of the batch
                 # -- actor
                 old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
@@ -309,7 +276,7 @@ class AMPPPO:
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -334,9 +301,6 @@ class AMPPPO:
                         kl_mean /= self.gpu_world_size
 
                     # Update the learning rate
-                    # Perform this adaptation only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -380,22 +344,21 @@ class AMPPPO:
                 # if we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    obs_batch, _ = data_augmentation_func(
-                        obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
-                    )
+                    obs_batch, _ = data_augmentation_func(obs=obs_batch, actions=None, env=self.symmetry["_env"])
                     # compute number of augmentations per sample
-                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+                    num_aug = int(
+                        (obs_batch.batch_size[0] if hasattr(obs_batch, "batch_size") else obs_batch.shape[0])
+                        / original_batch_size
+                    )
 
                 # actions predicted by the actor for symmetrically-augmented observations
                 mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
 
                 # compute the symmetrically augmented actions
                 # note: we are assuming the first augmentation is the original one.
-                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
-                #   However, the symmetry loss is computed using the mean of the distribution.
                 action_mean_orig = mean_actions_batch[:original_batch_size]
                 _, actions_mean_symm_batch = data_augmentation_func(
-                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
                 )
 
                 # compute the loss (we skip the first augmentation as it is the original one)
@@ -409,12 +372,13 @@ class AMPPPO:
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # Random Network Distillation loss
+            # Random Network Distillation loss (3.1.0 style)
             if self.rnd:
-                # predict the embedding and the target
+                with torch.no_grad():
+                    rnd_state_batch = self.rnd.get_rnd_state(obs_batch[:original_batch_size])
+                    rnd_state_batch = self.rnd.state_normalizer(rnd_state_batch)
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # compute the loss as the mean squared error
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
@@ -536,6 +500,8 @@ class AMPPPO:
         grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
+        if len(grads) == 0:
+            return
         all_grads = torch.cat(grads)
 
         # Average the gradients across all GPUs
@@ -552,7 +518,5 @@ class AMPPPO:
         for param in all_params:
             if param.grad is not None:
                 numel = param.numel()
-                # copy data back from shared buffer
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # update the offset for the next parameter
                 offset += numel
