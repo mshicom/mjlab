@@ -1,22 +1,30 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2024, The RSL-RL Project Developers.
+# All rights reserved.
+# Original code is licensed under the BSD-3-Clause license.
+#
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
 #
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025-2026, The Legged Lab Project Developers.
+# All rights reserved.
+#
+# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
+# All rights reserved.
+# Modifications are licensed under the BSD-3-Clause license.
+#
+# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
+# with additional modifications by the TienKung-Lab Project,
+# and is distributed under the BSD-3-Clause license.
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 from rsl_rl.utils import unpad_trajectories
 
 
-class Memory(nn.Module):
-    """Memory module for recurrent networks.
-
-    This module is used to store the hidden states of the policy.
-    Currently only supports GRU and LSTM.
-    """
-
+class Memory(torch.nn.Module):
     def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256):
         super().__init__()
         # RNN

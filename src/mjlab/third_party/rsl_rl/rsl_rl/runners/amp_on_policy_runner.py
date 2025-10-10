@@ -26,19 +26,20 @@ from collections import deque
 import torch
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.algorithms import AMPPPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
+    Discriminator,
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
 )
-from rsl_rl.utils import store_code_state
+from rsl_rl.utils import AMPLoader, Normalizer, store_code_state
 
 
-class OnPolicyRunner:
+class AmpOnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
@@ -52,7 +53,7 @@ class OnPolicyRunner:
         self._configure_multi_gpu()
 
         # resolve training type depending on the algorithm
-        if self.alg_cfg["class_name"] == "PPO":
+        if self.alg_cfg["class_name"] in ["PPO", "AMPPPO"]:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
@@ -105,10 +106,35 @@ class OnPolicyRunner:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
+        # init amp loader
+        amp_data = AMPLoader(
+            device,
+            time_between_frames=self.env.step_dt,
+            preload_transitions=True,
+            num_preload_transitions=train_cfg["amp_num_preload_transitions"],
+            motion_files=train_cfg["amp_motion_files"],
+        )
+        amp_normalizer = Normalizer(amp_data.observation_dim)
+        discriminator = Discriminator(
+            amp_data.observation_dim * 2,
+            train_cfg["amp_reward_coef"],
+            train_cfg["amp_discr_hidden_dims"],
+            device,
+            train_cfg["amp_task_reward_lerp"],
+        ).to(self.device)
+        min_std = torch.zeros(len(train_cfg["min_normalized_std"]), device=self.device, requires_grad=False)
+
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(
-            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+        self.alg: AMPPPO = alg_class(
+            policy,
+            discriminator,
+            amp_data,
+            amp_normalizer,
+            device=self.device,
+            min_std=min_std,
+            **self.alg_cfg,
+            multi_gpu_cfg=self.multi_gpu_cfg,
         )
 
         # store training configuration
@@ -182,7 +208,8 @@ class OnPolicyRunner:
         # start learning
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        amp_obs = self.env.get_amp_obs_for_expert_trans()
+        obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -215,11 +242,17 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    actions = self.alg.act(obs, privileged_obs, amp_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    next_amp_obs = self.env.get_amp_obs_for_expert_trans()
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    obs, rewards, dones, next_amp_obs = (
+                        obs.to(self.device),
+                        rewards.to(self.device),
+                        dones.to(self.device),
+                        next_amp_obs.to(self.device),
+                    )
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -229,8 +262,17 @@ class OnPolicyRunner:
                     else:
                         privileged_obs = obs
 
-                    # process the step
-                    self.alg.process_env_step(rewards, dones, infos)
+                    # Account for terminal state transitions
+                    next_amp_obs_with_term = torch.clone(next_amp_obs)
+                    reset_env_ids = self.env.reset_env_ids
+                    terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
+                    next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
+
+                    rewards = self.alg.discriminator.predict_amp_reward(
+                        amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
+                    )[0]
+                    amp_obs = torch.clone(next_amp_obs)
+                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
@@ -413,6 +455,8 @@ class OnPolicyRunner:
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "amp_normalizer": self.alg.amp_normalizer,
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -436,6 +480,8 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+        self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
         # -- Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
@@ -477,6 +523,7 @@ class OnPolicyRunner:
     def train_mode(self):
         # -- PPO
         self.alg.policy.train()
+        self.alg.discriminator.train()
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.train()
@@ -488,6 +535,7 @@ class OnPolicyRunner:
     def eval_mode(self):
         # -- PPO
         self.alg.policy.eval()
+        self.alg.discriminator.eval()
         # -- RND
         if self.alg.rnd:
             self.alg.rnd.eval()
