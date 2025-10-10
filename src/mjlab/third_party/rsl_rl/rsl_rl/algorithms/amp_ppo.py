@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, Discriminator
 from rsl_rl.modules.rnd import RandomNetworkDistillation
+from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
-from rsl_rl.utils import string_to_callable
-
+from rsl_rl.utils import string_to_callable, AMPLoader
 
 class AMPPPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -21,11 +21,6 @@ class AMPPPO:
     def __init__(
         self,
         policy,
-        discriminator,
-        amp_data,
-        amp_normalizer,
-        amp_replay_buffer_size=100000,
-        min_std=None,
         # PPO params (use 3.1.0 defaults unless overridden)
         num_learning_epochs=5,
         num_mini_batches=4,
@@ -47,6 +42,8 @@ class AMPPPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # AMP parameters
+        amp_cfg: dict | None = None,
     ):
         # device-related parameters
         self.device = device
@@ -59,12 +56,15 @@ class AMPPPO:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # RND components (match 3.1.0 usage)
+        # RND components
         if rnd_cfg is not None:
-            # Extract parameters used here to avoid passing them twice
+            # Extract parameters used in ppo
             rnd_lr = rnd_cfg.pop("learning_rate", 1e-3)
+            # Create RND module
             self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
-            self.rnd_optimizer = optim.Adam(self.rnd.predictor.parameters(), lr=rnd_lr)
+            # Create RND optimizer
+            params = self.rnd.predictor.parameters()
+            self.rnd_optimizer = optim.Adam(params, lr=rnd_lr)
         else:
             self.rnd = None
             self.rnd_optimizer = None
@@ -90,15 +90,41 @@ class AMPPPO:
         else:
             self.symmetry = None
 
-        # Discriminator components
-        self.amploss_coef = 1.0
-        self.min_std = min_std
-        self.discriminator = discriminator
-        self.discriminator.to(self.device)
-        self.amp_transition = RolloutStorage.Transition()
-        self.amp_storage = ReplayBuffer(discriminator.input_dim // 2, amp_replay_buffer_size, device)
-        self.amp_data = amp_data
-        self.amp_normalizer = amp_normalizer
+        # AMP components
+        if amp_cfg is not None:
+            self.amp_data = AMPLoader(
+                device,
+                time_between_frames=self.env.step_dt,
+                preload_transitions=True,
+                num_preload_transitions=amp_cfg["num_preload_transitions"],
+                motion_files=amp_cfg["motion_files"],
+            )
+            observation_dim = self.amp_data.observation_dim
+            self.amp_normalizer = EmpiricalNormalization(observation_dim)
+            self.discriminator = Discriminator(
+                observation_dim * 2,
+                amp_cfg["reward_coef"],
+                amp_cfg["discr_hidden_dims"],
+                device,
+                amp_cfg["task_reward_lerp"],
+            ).to(self.device)
+
+            self.amploss_coef = amp_cfg["reward_coef"]
+            amp_replay_buffer_size =  amp_cfg["num_preload_transitions"]
+ 
+            self.amp_transition = RolloutStorage.Transition()
+            self.amp_storage = ReplayBuffer(discriminator.input_dim // 2, amp_replay_buffer_size, device)
+            
+            # Store amp configuration
+            self.amp = amp_cfg
+        else:
+            self.amp_data = None
+            self.amp_normalizer = None
+            self.discriminator = None
+            self.amp_transition = None
+            self.amp_storage = None
+            self.amploss_coef = 0.0
+            self.amp = None
 
         # PPO components
         self.policy = policy

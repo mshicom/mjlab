@@ -4,11 +4,11 @@ import os
 import statistics
 import time
 from collections import deque
-
+from typing import Union
 import torch
 
 import rsl_rl
-from rsl_rl.algorithms import AMPPPO
+from rsl_rl.algorithms import AMPPPO, PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -17,8 +17,7 @@ from rsl_rl.modules import (
     StudentTeacher,
     StudentTeacherRecurrent,
 )
-from rsl_rl.utils import AMPLoader, Normalizer, store_code_state
-
+from rsl_rl.utils import store_code_state
 
 class AmpOnPolicyRunner:
     """On-policy runner for AMP training and evaluation (v3.1.0-style API)."""
@@ -72,33 +71,14 @@ class AmpOnPolicyRunner:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # init amp loader and components
-        amp_data = AMPLoader(
-            device,
-            time_between_frames=self.env.step_dt,
-            preload_transitions=True,
-            num_preload_transitions=train_cfg["amp_num_preload_transitions"],
-            motion_files=train_cfg["amp_motion_files"],
-        )
-        amp_normalizer = Normalizer(amp_data.observation_dim)
-        discriminator = Discriminator(
-            amp_data.observation_dim * 2,
-            train_cfg["amp_reward_coef"],
-            train_cfg["amp_discr_hidden_dims"],
-            device,
-            train_cfg["amp_task_reward_lerp"],
-        ).to(self.device)
-        min_std = torch.zeros(len(train_cfg["min_normalized_std"]), device=self.device, requires_grad=False)
-
         # initialize algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: AMPPPO = alg_class(
+        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"] is not None:
+            alg_class = AMPPPO
+        else:
+            alg_class = eval(self.alg_cfg.pop("class_name"))
+        self.alg: Union[AMPPPO, PPO] = alg_class(
             policy,
-            discriminator,
-            amp_data,
-            amp_normalizer,
             device=self.device,
-            min_std=min_std,
             **self.alg_cfg,
             multi_gpu_cfg=self.multi_gpu_cfg,
         )
