@@ -7,16 +7,15 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
-from .discriminator import Discriminator
 from .rnd import *
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import *
+from .amp import *
 
 __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
     "StudentTeacher",
     "StudentTeacherRecurrent",
-    "Discriminator",
 ]

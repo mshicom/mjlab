@@ -1,9 +1,162 @@
 """RSL-RL configuration."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, MISSING
 from typing import Literal, Tuple
 
 
+@configclass
+class RslRlSymmetryCfg:
+    """Configuration for the symmetry-augmentation in the training.
+
+    When :meth:`use_data_augmentation` is True, the :meth:`data_augmentation_func` is used to generate
+    augmented observations and actions. These are then used to train the model.
+
+    When :meth:`use_mirror_loss` is True, the :meth:`mirror_loss_coeff` is used to weight the
+    symmetry-mirror loss. This loss is directly added to the agent's loss function.
+
+    If both :meth:`use_data_augmentation` and :meth:`use_mirror_loss` are False, then no symmetry-based
+    training is enabled. However, the :meth:`data_augmentation_func` is called to compute and log
+    symmetry metrics. This is useful for performing ablations.
+
+    For more information, please check the work from :cite:`mittal2024symmetry`.
+    """
+
+    use_data_augmentation: bool = False
+    """Whether to use symmetry-based data augmentation. Default is False."""
+
+    use_mirror_loss: bool = False
+    """Whether to use the symmetry-augmentation loss. Default is False."""
+
+    data_augmentation_func: callable = MISSING
+    """The symmetry data augmentation function.
+
+    The function signature should be as follows:
+
+    Args:
+
+        env (VecEnv): The environment object. This is used to access the environment's properties.
+        obs (torch.Tensor | None): The observation tensor. If None, the observation is not used.
+        action (torch.Tensor | None): The action tensor. If None, the action is not used.
+        obs_type (str): The name of the observation type. Defaults to "policy".
+            This is useful when handling augmentation for different observation groups.
+
+    Returns:
+        A tuple containing the augmented observation and action tensors. The tensors can be None,
+        if their respective inputs are None.
+    """
+
+    mirror_loss_coeff: float = 0.0
+    """The weight for the symmetry-mirror loss. Default is 0.0."""
+
+
+@configclass
+class RslRlRndCfg:
+    """Configuration for the Random Network Distillation (RND) module.
+
+    For more information, please check the work from :cite:`schwarke2023curiosity`.
+    """
+
+    @configclass
+    class WeightScheduleCfg:
+        """Configuration for the weight schedule."""
+
+        mode: str = "constant"
+        """The type of weight schedule. Default is "constant"."""
+
+    @configclass
+    class LinearWeightScheduleCfg(WeightScheduleCfg):
+        """Configuration for the linear weight schedule.
+
+        This schedule decays the weight linearly from the initial value to the final value
+        between :attr:`initial_step` and before :attr:`final_step`.
+        """
+
+        mode: str = "linear"
+
+        final_value: float = MISSING
+        """The final value of the weight parameter."""
+
+        initial_step: int = MISSING
+        """The initial step of the weight schedule.
+
+        For steps before this step, the weight is the initial value specified in :attr:`RslRlRndCfg.weight`.
+        """
+
+        final_step: int = MISSING
+        """The final step of the weight schedule.
+
+        For steps after this step, the weight is the final value specified in :attr:`final_value`.
+        """
+
+    @configclass
+    class StepWeightScheduleCfg(WeightScheduleCfg):
+        """Configuration for the step weight schedule.
+
+        This schedule sets the weight to the value specified in :attr:`final_value` at step :attr:`final_step`.
+        """
+
+        mode: str = "step"
+
+        final_step: int = MISSING
+        """The final step of the weight schedule.
+
+        For steps after this step, the weight is the value specified in :attr:`final_value`.
+        """
+
+        final_value: float = MISSING
+        """The final value of the weight parameter."""
+
+    weight: float = 0.0
+    """The weight for the RND reward (also known as intrinsic reward). Default is 0.0.
+
+    Similar to other reward terms, the RND reward is scaled by this weight.
+    """
+
+    weight_schedule: WeightScheduleCfg | None = None
+    """The weight schedule for the RND reward. Default is None, which means the weight is constant."""
+
+    reward_normalization: bool = False
+    """Whether to normalize the RND reward. Default is False."""
+
+    state_normalization: bool = False
+    """Whether to normalize the RND state. Default is False."""
+
+    learning_rate: float = 1e-3
+    """The learning rate for the RND module. Default is 1e-3."""
+
+    num_outputs: int = 1
+    """The number of outputs for the RND module. Default is 1."""
+
+    predictor_hidden_dims: list[int] = [-1]
+    """The hidden dimensions for the RND predictor network. Default is [-1].
+
+    If the list contains -1, then the hidden dimensions are the same as the input dimensions.
+    """
+
+    target_hidden_dims: list[int] = [-1]
+    """The hidden dimensions for the RND target network. Default is [-1].
+
+    If the list contains -1, then the hidden dimensions are the same as the input dimensions.
+    """
+
+
+@dataclass
+class RslRlPpoAmpCfg:
+  reward_coef: float = 0.5
+  """Coefficient to scale the AMP reward."""
+  motion_files: list[str] = field(default_factory=list)
+  """The list of motion files for AMP."""
+  num_preload_transitions: int = 200000
+  """The number of transitions to preload before training."""
+  discr_hidden_dims: Tuple[int, ...] = (1024, 512, 256)
+  """The hidden dimensions of the AMP discriminator MLP network."""
+  task_reward_lerp: float = 0.0
+  """Interpolation factor between AMP reward and task reward.
+  Defaults to 0.0 (only AMP reward)."""
+  min_normalized_std: Tuple[int, ...] = (0.05) * 20
+  """The minimum normalized standard deviation for AMP."""
+  
+  
 @dataclass
 class RslRlPpoActorCriticCfg:
   """Config for the PPO actor-critic networks."""
@@ -24,8 +177,8 @@ class RslRlPpoActorCriticCfg:
   """The activation function to use in the actor and critic networks."""
   class_name: str = "ActorCritic"
   """Ignore, required by RSL-RL."""
-
-
+  
+  
 @dataclass
 class RslRlPpoAlgorithmCfg:
   """Config for the PPO algorithm."""
@@ -61,9 +214,17 @@ class RslRlPpoAlgorithmCfg:
   advantage is normalized over the mini-batches only. Otherwise, the advantage is
   normalized over the entire collected trajectories.
   """
-  class_name: str = "PPO"
+  class_name: str = "PPO"   # AMP_PPO
   """Ignore, required by RSL-RL."""
-
+  symmetry_cfg: RslRlSymmetryCfg | None = None
+  """The symmetry configuration. Default is None, in which case symmetry is not used."""
+  rnd_cfg: RslRlRndCfg | None = None
+  """The configuration for the Random Network Distillation (RND) module. Default is None,
+  in which case RND is not used.
+  """
+  amp_cfg: RslRlPpoAmpCfg | None = None
+  """The configuration for the Adversarial Motion Prior (AMP) module. Default is None,"""
+  
 
 @dataclass
 class RslRlBaseRunnerCfg:
@@ -98,7 +259,6 @@ class RslRlBaseRunnerCfg:
   """
   clip_actions: float | None = None
   """The clipping range for action values. If None (default), no clipping is applied."""
-
 
 @dataclass
 class RslRlOnPolicyRunnerCfg(RslRlBaseRunnerCfg):

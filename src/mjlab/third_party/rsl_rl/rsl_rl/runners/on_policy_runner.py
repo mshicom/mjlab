@@ -13,9 +13,11 @@ import warnings
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO
+# Use the updated PPO with AMP/RND/Symmetry integration
+from rsl_rl.modules.new_ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.modules.amp import resolve_amp_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 
@@ -102,11 +104,20 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs_next, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    obs_next, rewards, dones = (obs_next.to(self.device), rewards.to(self.device), dones.to(self.device))
+
+                    # AMP: let the AMP module extract features and add transitions (hides previous feature state)
+                    if hasattr(self.alg, "amp") and self.alg.amp is not None:
+                        self.alg.amp.update_from_env_extras(extras, dones)
+
+                    # process the step with PPO (normalizers, intrinsic reward, time-out bootstrap, storage)
+                    self.alg.process_env_step(obs_next, rewards, dones, extras)
+
+                    # prepare next observation
+                    obs = obs_next
+
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     # book keeping
@@ -402,6 +413,9 @@ class OnPolicyRunner:
         # resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
+        # resolve AMP config (sets time_between_frames, default replay sizes, etc.)
+        self.alg_cfg = resolve_amp_config(self.alg_cfg, self.env)
+
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -420,7 +434,7 @@ class OnPolicyRunner:
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
-        # initialize the algorithm
+        # initialize the algorithm (use the updated PPO)
         alg_class = eval(self.alg_cfg.pop("class_name"))
         alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
