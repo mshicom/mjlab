@@ -309,6 +309,15 @@ class OnPolicyRunner:
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+
+        # AMP (if used)
+        if hasattr(self.alg, "amp") and self.alg.amp is not None:
+            # include_replay=False by default; turn on if you really want to persist it
+            saved_dict["amp_state_dict"] = self.alg.amp.state_dict(include_replay=False)
+            # If your algorithm has a separate optimizer for AMP, save it too (optional):
+            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer is not None:
+                saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
+
         torch.save(saved_dict, path)
 
         # upload model to external logging service
@@ -330,6 +339,14 @@ class OnPolicyRunner:
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         # -- load current learning iteration
+
+        # AMP (if used)
+        if hasattr(self.alg, "amp") and self.alg.amp is not None and "amp_state_dict" in loaded_dict:
+            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+            if load_optimizer and "amp_optimizer_state_dict" in loaded_dict:
+                if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer is not None:
+                    self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]

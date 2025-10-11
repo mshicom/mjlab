@@ -201,6 +201,78 @@ class AdversarialMotionPrior(nn.Module):
         self._env_prev_feat = None
         self._env_prev_has = None
 
+    def state_dict(self, include_replay: bool = False) -> dict:
+        """
+        Returns a serializable AMP state dict.
+
+        Args:
+            include_replay: If True, include the replay buffer contents (can be large).
+        """
+        state = {
+            "discriminator": self.discriminator.state_dict(),
+            "reward_coef": self.reward_coef,
+            "loss_coef": self.loss_coef,
+            "grad_penalty_lambda": self.grad_penalty_lambda,
+            "observation_dim": self.replay.obs_shape[0] if hasattr(self, "replay") else None,
+        }
+        # Normalizer stats (if enabled)
+        if self.normalizer is not None:
+            state["normalizer"] = {
+                "count": self.normalizer.count.clone().cpu(),
+                "mean": self.normalizer.mean.clone().cpu(),
+                "var": self.normalizer.var.clone().cpu(),
+            }
+        else:
+            state["normalizer"] = None
+
+        # Replay buffer (optional)
+        if include_replay and hasattr(self, "replay") and self.replay is not None:
+            rb = self.replay
+            state["replay"] = {
+                "size": int(rb.size),
+                "ptr": int(rb.ptr),
+                "obs": rb.obs.clone().cpu(),
+                "next_obs": rb.next_obs.clone().cpu(),
+            }
+        else:
+            state["replay"] = None
+
+        # No need to persist expert loader contents; re-hydrated from dataset paths.
+        return state
+
+    def load_state_dict(self, state: dict, strict: bool = True):
+        """
+        Loads AMP state from a dict created by state_dict().
+        """
+        # Discriminator
+        self.discriminator.load_state_dict(state["discriminator"], strict=strict)
+
+        # Hyperparameters (optional)
+        self.reward_coef = state.get("reward_coef", self.reward_coef)
+        self.loss_coef = state.get("loss_coef", self.loss_coef)
+        self.grad_penalty_lambda = state.get("grad_penalty_lambda", self.grad_penalty_lambda)
+
+        # Normalizer
+        norm = state.get("normalizer", None)
+        if norm is not None and self.normalizer is not None:
+            with torch.no_grad():
+                self.normalizer.count.copy_(norm["count"].to(self.device))
+                self.normalizer.mean.copy_(norm["mean"].to(self.device))
+                self.normalizer.var.copy_(norm["var"].to(self.device))
+
+        # Replay buffer (optional)
+        rb_state = state.get("replay", None)
+        if rb_state is not None and hasattr(self, "replay") and self.replay is not None:
+            rb = self.replay
+            with torch.no_grad():
+                rb.obs.copy_(rb_state["obs"].to(self.device))
+                rb.next_obs.copy_(rb_state["next_obs"].to(self.device))
+                rb.size = rb_state["size"]
+                rb.ptr = rb_state["ptr"]
+
+        # Clear env prev buffers (always recomputed on-the-fly)
+        self.reset_env_buffer()
+        return self
 
 def resolve_amp_config(alg_cfg: dict, env) -> dict:
     """
