@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import glob
 import json
-from typing import Generator, Tuple, Iterable
+from typing import Generator, Iterable, Tuple
 
 import numpy as np
 import torch
@@ -19,22 +19,24 @@ from rsl_rl.storage import ReplayBuffer
 
 
 class AmpFeatureExtractor:
-    """Configurable feature extractor for AMP.
+    """Configurable feature extractor for AMP supporting temporal windows.
 
-    This extractor is used to:
-    - Build AMP feature vectors from environment `extras` (vectorized over envs).
-    - Build AMP feature vectors from motion frames loaded from disk.
+    Responsibilities:
+    - Extract per-frame base features from env extras or motion frames.
+    - Optionally aggregate features over a sliding window using a transform (stack, mean, fft magnitude).
+    - Maintain per-env rolling buffers for windowed env features (handles done resets).
 
-    By default it reproduces the previous hard-coded behavior:
-    - Env features are extracted from the first present key among:
-      ["amp_observations", "amp_obs", "amp_state", "amp"].
-    - Motion features include joint positions (20), joint velocities (20), and end-effector positions (12).
+    Notes:
+    - Motion frames are assumed to be raw pose arrays with the following layout:
+      [joint_pos(20), joint_vel(20), end_eff_pos(12), ...]
+      which matches previous implementation. You can toggle which parts to use.
+    - Env extras should already provide a per-frame AMP vector of the same base feature set as motion,
+      but this class will still operate generically for any feature dimension.
     """
 
-    # Defaults used in original implementation
     DEFAULT_ENV_KEYS = ("amp_observations", "amp_obs", "amp_state", "amp")
 
-    # Index map (expected for motion frames)
+    # Default indices for motion frame parsing (compatible with previous impl)
     JOINT_POS_SIZE = 20
     JOINT_VEL_SIZE = 20
     END_EFFECTOR_POS_SIZE = 12
@@ -54,13 +56,20 @@ class AmpFeatureExtractor:
         use_joint_pos: bool = True,
         use_joint_vel: bool = True,
         use_end_pos: bool = True,
+        # Windowing
+        window_size: int = 1,
+        window_transform: str = "stack",  # "stack", "mean", "fft_mag"
+        fft_keep: int | None = None,  # if None keep all rfft bins
+        pad_initial: bool = True,  # pad startup windows by repeating first valid frame
+        require_full_window: bool = False,  # if True, None is returned until window filled (env only)
     ):
+        # Env keys
         self.env_obs_keys = tuple(env_obs_keys) if env_obs_keys is not None else self.DEFAULT_ENV_KEYS
+
+        # Motion frame selection
         self.use_joint_pos = use_joint_pos
         self.use_joint_vel = use_joint_vel
         self.use_end_pos = use_end_pos
-
-        # Precompute slices for motion frames
         self._slices: list[slice] = []
         if self.use_joint_pos:
             self._slices.append(slice(self.JOINT_POSE_START_IDX, self.JOINT_POSE_END_IDX))
@@ -69,28 +78,191 @@ class AmpFeatureExtractor:
         if self.use_end_pos:
             self._slices.append(slice(self.END_POS_START_IDX, self.END_POS_END_IDX))
 
-    def from_env_extras(self, extras: dict, device: torch.device | str) -> torch.Tensor | None:
-        """Extract AMP features from environment extras dict.
+        # Window configuration
+        self.window_size = int(max(1, window_size))
+        self.window_transform = window_transform
+        self.fft_keep = fft_keep
+        self.pad_initial = pad_initial
+        self.require_full_window = require_full_window
 
-        Returns a tensor of shape [num_envs, feat_dim] or None if not present.
-        """
+        # Derived
+        self._base_feat_dim: int | None = None  # set after first motion/env feature seen
+        self._out_feat_dim_cache: dict[int, int] = {}
+
+        # Per-env buffers for windowed operation
+        self._env_win_buf: torch.Tensor | None = None  # [N, W, F]
+        self._env_win_filled: torch.Tensor | None = None  # [N] ints (0..W)
+
+    @property
+    def is_windowed(self) -> bool:
+        return self.window_size > 1
+
+    def reset_env_buffers(self):
+        """Clear per-env temporal buffers."""
+        self._env_win_buf = None
+        self._env_win_filled = None
+
+    # --------- Env feature extraction (per step) ---------
+
+    def from_env_extras(self, extras: dict, device: torch.device | str) -> torch.Tensor | None:
+        """Extract per-frame features directly from environment extras (no windowing)."""
         for key in self.env_obs_keys:
             if key in extras:
                 val = extras[key]
                 if not torch.is_tensor(val):
-                    return torch.as_tensor(val, dtype=torch.float32, device=device)
-                return val.to(device)
+                    val = torch.as_tensor(val, dtype=torch.float32, device=device)
+                else:
+                    val = val.to(device)
+                # lazily set base dim if needed
+                if self._base_feat_dim is None:
+                    self._base_feat_dim = int(val.shape[-1])
+                return val
         return None
 
+    def env_step(self, extras: dict, device: torch.device | str, dones: torch.Tensor | None = None) -> torch.Tensor | None:
+        """Extract windowed features from environment extras, maintaining per-env buffers.
+
+        Returns:
+            Tensor [N, out_dim] if window available (or padded), otherwise None if require_full_window=True and not filled.
+        """
+        curr = self.from_env_extras(extras, device)
+        if curr is None:
+            return None
+
+        # Normalize shape
+        if curr.ndim == 1:
+            curr = curr.unsqueeze(0)
+        n_envs, feat_dim = curr.shape
+
+        # Allocate buffers if needed or if env count changed
+        if self._env_win_buf is None or self._env_win_buf.shape[0] != n_envs or self._env_win_buf.shape[2] != feat_dim:
+            self._env_win_buf = torch.zeros(n_envs, self.window_size, feat_dim, device=device, dtype=curr.dtype)
+            self._env_win_filled = torch.zeros(n_envs, dtype=torch.long, device=device)
+
+        # Handle resets prior to writing current frame to avoid cross-episode leakage
+        if dones is not None:
+            done_mask = dones.reshape(-1).to(device).bool()
+            if done_mask.any():
+                self._env_win_buf[done_mask].zero_()
+                self._env_win_filled[done_mask] = 0  # type: ignore
+
+        # Shift left and insert current at the end
+        self._env_win_buf = torch.roll(self._env_win_buf, shifts=-1, dims=1)  # type: ignore
+        self._env_win_buf[:, -1, :] = curr  # type: ignore
+        # Update filled counts
+        self._env_win_filled = torch.clamp(self._env_win_filled + 1, max=self.window_size)  # type: ignore
+
+        if self.require_full_window and torch.any(self._env_win_filled < self.window_size):  # type: ignore
+            return None
+
+        # Prepare window tensor with optional padding
+        win = self._env_win_buf  # [N, W, F]
+        if self.pad_initial:
+            # For envs not yet filled fully, pad the leading frames with the earliest available frame (replicate)
+            fill_counts = self._env_win_filled  # [N]
+            not_full = fill_counts < self.window_size
+            if torch.any(not_full):
+                # index for per-env first valid frame position within buffer
+                # Current policy: replicate last (most recent) frame backwards to fill
+                # To implement pad at the front: set first (W - filled) frames equal to the first valid frame
+                # Here, since we keep most recent at -1, and shift each step, earlier frames contain history or zeros.
+                # We'll just take the last frame and broadcast to the entire window where needed, then overwrite the last
+                # 'filled' slots are already correct; the front (W-filled) will be overwritten by the broadcast below masked.
+                pad_view = win[not_full]  # [M, W, F]
+                last = pad_view[:, -1:, :].expand(-1, self.window_size, -1)
+                # Build mask for padded positions
+                m = (torch.arange(self.window_size, device=device).unsqueeze(0) < (self.window_size - fill_counts[not_full].unsqueeze(1)))
+                # Assign padded positions
+                pad_view[m] = last[m]
+
+        # Transform window -> feature vector
+        out = self._transform_window(win)
+        return out
+
+    # --------- Motion feature extraction ---------
+
     def from_motion_frame(self, frame: torch.Tensor) -> torch.Tensor:
-        """Extract AMP features from a single motion frame [D]."""
+        """Extract per-frame base features from a single motion frame [D]."""
         parts = [frame[s] for s in self._slices]
-        return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        feat = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        if self._base_feat_dim is None:
+            self._base_feat_dim = int(feat.shape[-1])
+        return feat
 
     def from_motion_frame_batch(self, frames: torch.Tensor) -> torch.Tensor:
-        """Extract AMP features from a batch of motion frames [B, D]."""
+        """Extract per-frame base features from a batch of motion frames [B, D]."""
         parts = [frames[:, s] for s in self._slices]
-        return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        feat = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        if self._base_feat_dim is None:
+            self._base_feat_dim = int(feat.shape[-1])
+        return feat
+
+    def from_motion_window_batch(self, frames_win: torch.Tensor) -> torch.Tensor:
+        """Extract windowed features from a batch of motion windows.
+
+        Args:
+            frames_win: Tensor [B, W, D] of raw motion frames (not yet sliced to base features).
+
+        Returns:
+            Tensor [B, out_dim] of processed window features.
+        """
+        B, W, D = frames_win.shape
+        # Slice base features per frame, then reshape to [B, W, F]
+        base = self.from_motion_frame_batch(frames_win.reshape(B * W, D)).reshape(B, W, -1)
+        return self._transform_window(base)
+
+    # --------- Output dimension helpers ---------
+
+    def output_dim_for_feat_dim(self, feat_dim: int) -> int:
+        """Return output feature dimension given per-frame base feature dimension."""
+        if self.window_size <= 1:
+            return feat_dim
+        if feat_dim in self._out_feat_dim_cache:
+            return self._out_feat_dim_cache[feat_dim]
+        if self.window_transform == "stack":
+            out = feat_dim * self.window_size
+        elif self.window_transform == "mean":
+            out = feat_dim
+        elif self.window_transform == "fft_mag":
+            freq_bins = self.window_size // 2 + 1
+            if self.fft_keep is not None:
+                freq_bins = int(min(freq_bins, self.fft_keep))
+            out = feat_dim * freq_bins
+        else:
+            raise ValueError(f"Unknown window_transform: {self.window_transform}")
+        self._out_feat_dim_cache[feat_dim] = out
+        return out
+
+    # --------- Internal transforms ---------
+
+    def _transform_window(self, win: torch.Tensor) -> torch.Tensor:
+        """Apply the configured window transform to a window tensor.
+
+        Args:
+            win: Tensor [N, W, F] for env or [B, W, F] for motion.
+
+        Returns:
+            Tensor [N, out_dim] or [B, out_dim].
+        """
+        if self.window_size <= 1:
+            # unwrap to [N, F]
+            return win[:, -1, :]
+
+        if self.window_transform == "stack":
+            return win.reshape(win.shape[0], self.window_size * win.shape[2])
+
+        if self.window_transform == "mean":
+            return win.mean(dim=1)
+
+        if self.window_transform == "fft_mag":
+            # rFFT across time dimension (W)
+            fft_vals = torch.fft.rfft(win, dim=1)  # [N, Freq, F]
+            mag = torch.abs(fft_vals)
+            if self.fft_keep is not None:
+                mag = mag[:, : self.fft_keep, :]
+            return mag.reshape(mag.shape[0], -1)
+
+        raise ValueError(f"Unknown window_transform: {self.window_transform}")
 
 
 class Discriminator(nn.Module):
@@ -106,7 +278,6 @@ class Discriminator(nn.Module):
 
     def __init__(self, input_dim: int, amp_reward_coef: float, hidden_layer_sizes: list[int], device: str, task_reward_lerp: float = 0.0):
         super().__init__()
-
         self.device = device
         self.input_dim = input_dim
 
@@ -199,7 +370,7 @@ class Discriminator(nn.Module):
 class AMPLoader:
     """Expert dataset loader for AMP observations."""
 
-    # Retain indices for default feature extractor
+    # Keep constants for compatibility (not strictly required in new design)
     JOINT_POS_SIZE = AmpFeatureExtractor.JOINT_POS_SIZE
     JOINT_VEL_SIZE = AmpFeatureExtractor.JOINT_VEL_SIZE
     END_EFFECTOR_POS_SIZE = AmpFeatureExtractor.END_EFFECTOR_POS_SIZE
@@ -238,16 +409,14 @@ class AMPLoader:
         self.time_between_frames = time_between_frames
         self.feature_extractor = feature_extractor or AmpFeatureExtractor()
 
-        # Discover motion files if not provided
         if motion_files is None:
             motion_files = glob.glob("datasets/motion_amp_expert/*")
 
-        # Values to store for each trajectory.
-        self.trajectories: list[torch.Tensor] = []         # feature frames
-        self.trajectories_full: list[torch.Tensor] = []    # raw frames (at least up to END_POS_END_IDX)
+        # Raw motion trajectories (min length up to END_POS_END_IDX)
+        self.trajectories_full: list[torch.Tensor] = []
         self.trajectory_names: list[str] = []
         self.trajectory_idxs: list[int] = []
-        self.trajectory_lens: list[float] = []  # Traj length in seconds.
+        self.trajectory_lens: list[float] = []
         self.trajectory_weights: list[float] = []
         self.trajectory_frame_durations: list[float] = []
         self.trajectory_num_frames: list[float] = []
@@ -257,17 +426,12 @@ class AMPLoader:
             with open(motion_file) as f:
                 motion_json = json.load(f)
                 motion_data = np.array(motion_json["Frames"])
-                # Use at least the range required by default extractor
                 full = torch.tensor(
                     motion_data[:, : AmpFeatureExtractor.END_POS_END_IDX],
                     dtype=torch.float32,
                     device=device,
                 )
                 self.trajectories_full.append(full)
-                # Build feature frames using extractor
-                feat = self.feature_extractor.from_motion_frame_batch(full)
-                self.trajectories.append(feat)
-
                 self.trajectory_idxs.append(i)
                 self.trajectory_weights.append(float(motion_json["MotionWeight"]))
                 frame_duration = float(motion_json["FrameDuration"])
@@ -276,81 +440,51 @@ class AMPLoader:
                 self.trajectory_lens.append(traj_len)
                 self.trajectory_num_frames.append(float(motion_data.shape[0]))
 
-        # Trajectory weights are used to sample some trajectories more than others.
         self.trajectory_weights = np.array(self.trajectory_weights)
         self.trajectory_weights = self.trajectory_weights / np.sum(self.trajectory_weights)
         self.trajectory_frame_durations = np.array(self.trajectory_frame_durations)
         self.trajectory_lens = np.array(self.trajectory_lens)
         self.trajectory_num_frames = np.array(self.trajectory_num_frames)
 
-        # Preload transitions (features) for speed, if desired.
+        # Compute observation dimension from feature extractor
+        base_feat = self.feature_extractor.from_motion_frame(self.trajectories_full[0][0])
+        self._base_feat_dim = int(base_feat.shape[-1])
+        self._observation_dim = self.feature_extractor.output_dim_for_feat_dim(self._base_feat_dim)
+
+        # Preload transitions for speed (features)
         self.preload_transitions = preload_transitions
         if self.preload_transitions:
             traj_idxs = self.weighted_traj_idx_sample_batch(num_preload_transitions)
             times = self.traj_time_sample_batch(traj_idxs)
-            # Directly preload feature transitions
-            self.preloaded_feat_s = self.get_frame_at_time_batch(traj_idxs, times)
-            self.preloaded_feat_s_next = self.get_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
+            self.preloaded_feat_s = self.get_feature_at_time_batch(traj_idxs, times)
+            self.preloaded_feat_s_next = self.get_feature_at_time_batch(traj_idxs, times + self.time_between_frames)
 
-        # Convenience tensor of all frames if needed elsewhere
+        # Convenience big tensor if needed elsewhere
         self.all_trajectories_full = torch.vstack(self.trajectories_full)
 
+    # --------- Sampling utilities ---------
+
     def weighted_traj_idx_sample(self) -> int:
-        """Get traj idx via weighted sampling."""
         return int(np.random.choice(self.trajectory_idxs, p=self.trajectory_weights))
 
     def weighted_traj_idx_sample_batch(self, size: int) -> np.ndarray:
-        """Batch sample traj idxs."""
         return np.random.choice(self.trajectory_idxs, size=size, p=self.trajectory_weights, replace=True)
 
     def traj_time_sample(self, traj_idx: int) -> float:
-        """Sample random time for traj."""
         subst = self.time_between_frames + self.trajectory_frame_durations[traj_idx]
         return max(0.0, (self.trajectory_lens[traj_idx] * np.random.uniform() - subst))
 
     def traj_time_sample_batch(self, traj_idxs: np.ndarray) -> np.ndarray:
-        """Sample random time for multiple trajectories."""
         subst = self.time_between_frames + self.trajectory_frame_durations[traj_idxs]
         time_samples = self.trajectory_lens[traj_idxs] * np.random.uniform(size=len(traj_idxs)) - subst
         return np.maximum(np.zeros_like(time_samples), time_samples)
 
+    # --------- Interpolation helpers ---------
+
     def slerp(self, frame1: torch.Tensor, frame2: torch.Tensor, blend: torch.Tensor | float) -> torch.Tensor:
         return (1.0 - blend) * frame1 + blend * frame2
 
-    def get_trajectory(self, traj_idx: int) -> torch.Tensor:
-        """Returns trajectory of AMP features."""
-        return self.trajectories[traj_idx]
-
-    def get_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
-        """Returns feature frame for the given trajectory at the specified time."""
-        p = float(time) / self.trajectory_lens[traj_idx]
-        n = self.trajectories[traj_idx].shape[0]
-        idx_low, idx_high = int(np.floor(p * n)), int(np.ceil(p * n))
-        frame_start = self.trajectories[traj_idx][idx_low]
-        frame_end = self.trajectories[traj_idx][idx_high]
-        blend = p * n - idx_low
-        return self.slerp(frame_start, frame_end, blend)
-
-    def get_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
-        """Returns feature frames for given trajectories at specified times."""
-        p = times / self.trajectory_lens[traj_idxs]
-        n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.floor(p * n).astype(np.int64)
-        idx_high = np.ceil(p * n).astype(np.int64)
-
-        obs_dim = self.observation_dim
-        all_starts = torch.zeros(len(traj_idxs), obs_dim, device=self.device)
-        all_ends = torch.zeros(len(traj_idxs), obs_dim, device=self.device)
-        for traj_idx in set(traj_idxs):
-            trajectory = self.trajectories[traj_idx]  # features
-            traj_mask = traj_idxs == traj_idx
-            all_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_ends[traj_mask] = trajectory[idx_high[traj_mask]]
-        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
-        return self.slerp(all_starts, all_ends, blend)
-
     def get_full_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
-        """Returns interpolated full motion frame."""
         p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories_full[traj_idx].shape[0]
         idx_low, idx_high = int(np.floor(p * n)), int(np.ceil(p * n))
@@ -360,7 +494,6 @@ class AMPLoader:
         return self.slerp(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
-        """Returns blended full frames for a batch of trajectories and times."""
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low = np.floor(p * n).astype(np.int64)
@@ -369,35 +502,75 @@ class AMPLoader:
         out_dim = self.trajectories_full[0].shape[1]
         all_starts = torch.zeros(len(traj_idxs), out_dim, device=self.device)
         all_ends = torch.zeros(len(traj_idxs), out_dim, device=self.device)
-        for traj_idx in set(traj_idxs):
-            trajectory = self.trajectories_full[traj_idx]
-            traj_mask = traj_idxs == traj_idx
-            all_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_ends[traj_mask] = trajectory[idx_high[traj_mask]]
+        for tid in set(traj_idxs):
+            trajectory = self.trajectories_full[tid]
+            mask = traj_idxs == tid
+            all_starts[mask] = trajectory[idx_low[mask]]
+            all_ends[mask] = trajectory[idx_high[mask]]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_starts, all_ends, blend)
 
+    # --------- Window building for motion ---------
+
+    def get_window_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray, window_size: int) -> torch.Tensor:
+        """Build a batch of motion windows ending at times.
+
+        Returns:
+            Tensor [B, W, D_full]
+        """
+        B = len(traj_idxs)
+        W = window_size
+        D_full = self.trajectories_full[0].shape[1]
+        out = torch.zeros(B, W, D_full, device=self.device)
+        # Group by traj id for efficiency
+        unique_ids = np.unique(traj_idxs)
+        for tid in unique_ids:
+            mask_np = traj_idxs == tid
+            mask = torch.from_numpy(mask_np).to(self.device, dtype=torch.bool)
+            num = int(mask.sum().item())
+            if num == 0:
+                continue
+            times_sel = torch.tensor(times[mask_np], device=self.device, dtype=torch.float32)  # [M]
+            dt = float(self.trajectory_frame_durations[tid])
+            # oldest to newest times in window
+            offsets = torch.arange(-(W - 1), 1, device=self.device, dtype=torch.float32) * dt
+            times_win = (times_sel.unsqueeze(1) + offsets.unsqueeze(0)).clamp_min_(0.0)  # [M, W]
+            # Flatten for batch interpolation
+            trajs_flat = np.full((num * W,), tid, dtype=traj_idxs.dtype)
+            frames_flat = self.get_full_frame_at_time_batch(trajs_flat, times_win.reshape(-1).cpu().numpy())
+            out[mask] = frames_flat.reshape(num, W, D_full)
+        return out
+
+    # --------- Feature at time sampling (handles windowed/non-windowed) ---------
+
+    def get_feature_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
+        if self.feature_extractor.is_windowed:
+            win = self.get_window_at_time_batch(np.array([traj_idx]), np.array([time]), self.feature_extractor.window_size)
+            feat = self.feature_extractor.from_motion_window_batch(win)  # [1, F]
+            return feat[0]
+        # non-windowed
+        frame = self.get_full_frame_at_time(traj_idx, time)
+        return self.feature_extractor.from_motion_frame(frame)
+
+    def get_feature_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
+        if self.feature_extractor.is_windowed:
+            win = self.get_window_at_time_batch(traj_idxs, times, self.feature_extractor.window_size)  # [B, W, D]
+            return self.feature_extractor.from_motion_window_batch(win)  # [B, F]
+        # non-windowed
+        frames = self.get_full_frame_at_time_batch(traj_idxs, times)  # [B, D]
+        return self.feature_extractor.from_motion_frame_batch(frames)
+
+    # --------- Public sampling APIs ---------
+
     def get_full_frame(self) -> torch.Tensor:
-        """Returns random full frame."""
         traj_idx = self.weighted_traj_idx_sample()
         sampled_time = self.traj_time_sample(traj_idx)
         return self.get_full_frame_at_time(traj_idx, sampled_time)
 
     def get_full_frame_batch(self, num_frames: int) -> torch.Tensor:
-        """Returns a batch of full frames."""
         traj_idxs = self.weighted_traj_idx_sample_batch(num_frames)
         times = self.traj_time_sample_batch(traj_idxs)
         return self.get_full_frame_at_time_batch(traj_idxs, times)
-
-    def blend_frame_pose(self, frame0: torch.Tensor, frame1: torch.Tensor, blend: float) -> torch.Tensor:
-        """Linearly interpolate between two frames (legacy, not used in new pipeline)."""
-        joints0, joints1 = AMPLoader.get_joint_pose(frame0), AMPLoader.get_joint_pose(frame1)
-        joint_vel_0, joint_vel_1 = AMPLoader.get_joint_vel(frame0), AMPLoader.get_joint_vel(frame1)
-
-        blend_joint_q = self.slerp(joints0, joints1, blend)
-        blend_joints_vel = self.slerp(joint_vel_0, joint_vel_1, blend)
-
-        return torch.cat([blend_joint_q, blend_joints_vel])
 
     def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
         """Generates a batch of AMP feature transitions (expert)."""
@@ -409,19 +582,19 @@ class AMPLoader:
             else:
                 traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
                 times = self.traj_time_sample_batch(traj_idxs)
-                s = self.get_frame_at_time_batch(traj_idxs, times)
-                s_next = self.get_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
+                s = self.get_feature_at_time_batch(traj_idxs, times)
+                s_next = self.get_feature_at_time_batch(traj_idxs, times + self.time_between_frames)
             yield s, s_next
 
     @property
     def observation_dim(self) -> int:
-        """Size of AMP feature observations."""
-        return self.trajectories[0].shape[1]
+        return self._observation_dim
 
     @property
     def num_motions(self) -> int:
         return len(self.trajectory_names)
 
+    # Legacy helpers (kept for compatibility with potential external uses)
     @staticmethod
     def get_joint_pose(pose: torch.Tensor) -> torch.Tensor:
         return pose[AMPLoader.JOINT_POSE_START_IDX : AMPLoader.JOINT_POSE_END_IDX]
@@ -450,8 +623,8 @@ class AMPLoader:
 class AdversarialMotionPrior(nn.Module):
     """AMP module that encapsulates discriminator, expert loader, normalization, and policy replay.
 
-    Also manages environment feature extraction and transition buffering, to avoid
-    storing state in the runner.
+    It also manages environment feature extraction and transition buffering, to avoid any
+    runner-side state such as previous AMP features.
     """
 
     def __init__(
@@ -469,7 +642,7 @@ class AdversarialMotionPrior(nn.Module):
         # Optimization / regularization
         state_normalization: bool = True,
         grad_penalty_lambda: float = 10.0,
-        # Feature extraction
+        # Feature extraction (env + motion)
         env_obs_keys: Iterable[str] | None = None,
         feature_extractor: AmpFeatureExtractor | None = None,
         # Device
@@ -511,11 +684,10 @@ class AdversarialMotionPrior(nn.Module):
 
         # Coefficients
         self.reward_coef = reward_coef
-        # scale used for adding discriminator training loss to PPO (kept equal to reward coef for parity)
-        self.loss_coef = reward_coef
+        self.loss_coef = reward_coef  # keep parity with reward scaling
         self.grad_penalty_lambda = grad_penalty_lambda
 
-        # Internal environment feature buffers (to avoid storing in runner)
+        # Internal buffer to build (s, s_next) transitions at env-step granularity
         self._env_prev_feat: torch.Tensor | None = None
         self._env_prev_has: torch.BoolTensor | None = None
 
@@ -539,44 +711,36 @@ class AdversarialMotionPrior(nn.Module):
         self.replay.insert(state, next_state)
 
     def policy_generator(self, num_batches: int, batch_size: int):
-        """Policy transitions generator (from replay)."""
         return self.replay.feed_forward_generator(num_batches, batch_size)
 
     def expert_generator(self, num_batches: int, batch_size: int):
-        """Expert transitions generator (from dataset)."""
         return self.loader.feed_forward_generator(num_batches, batch_size)
 
     def update_from_env_extras(self, extras: dict, dones: torch.Tensor | None = None):
-        """Extract features from env extras and add transitions to replay buffer.
+        """Extract features from env extras and append AMP transitions into replay buffer.
 
-        This method manages the previous-step buffer internally to avoid storing it in the runner.
-        It filters out cross-episode transitions using the dones mask.
-
-        Args:
-            extras: Environment extras dict from env.step().
-            dones: Done flags tensor of shape [num_envs] or [num_envs, 1]. If None, assumes all False.
+        - Uses AmpFeatureExtractor to perform optional window aggregation (with its own env buffers).
+        - Manages (prev, curr) pairing internally; masks out cross-episode transitions using dones.
         """
-        curr_feat = self.feature_extractor.from_env_extras(extras, self.device)
+        curr_feat = (
+            self.feature_extractor.env_step(extras, self.device, dones)
+            if self.feature_extractor.is_windowed
+            else self.feature_extractor.from_env_extras(extras, self.device)
+        )
         if curr_feat is None:
             return
 
-        # Normalize inputs shape: [N, D]
         if curr_feat.ndim == 1:
             curr_feat = curr_feat.unsqueeze(0)
-
         n_envs = curr_feat.shape[0]
 
-        if dones is None:
-            done_mask = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
-        else:
-            done_mask = dones.reshape(-1).to(self.device).bool()
-
-        # Allocate/resize buffers on first call or env-count change
         if self._env_prev_feat is None or self._env_prev_feat.shape[0] != n_envs:
             self._env_prev_feat = torch.zeros_like(curr_feat)
             self._env_prev_has = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
 
+        done_mask = torch.zeros(n_envs, dtype=torch.bool, device=self.device) if dones is None else dones.reshape(-1).bool()
         prev_has = self._env_prev_has  # type: ignore
+
         if prev_has.any():
             add_mask = prev_has & (~done_mask)
             if add_mask.any():
@@ -584,16 +748,16 @@ class AdversarialMotionPrior(nn.Module):
                 s_next = curr_feat[add_mask]
                 self.add_transition(s, s_next)
 
-        # Update buffers
+        # Update prev buffers
         self._env_prev_feat = curr_feat
         self._env_prev_has.fill_(True)  # type: ignore
-        # Clear for environments that finished this step (avoid cross-episode links)
         self._env_prev_has[done_mask] = False  # type: ignore
 
     def reset_env_buffer(self):
-        """Clear internal environment buffers (e.g., at the start of a new rollout)."""
+        """Clear internal environment buffers (window + prev)."""
         self._env_prev_feat = None
         self._env_prev_has = None
+        self.feature_extractor.reset_env_buffers()
 
     def compute_batch_losses(
         self,
@@ -602,7 +766,6 @@ class AdversarialMotionPrior(nn.Module):
         expert_state: torch.Tensor,
         expert_next_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
-        """Compute discriminator/adversarial losses and stats."""
         # Optional normalization
         if self.normalizer is not None:
             with torch.no_grad():
@@ -626,26 +789,18 @@ class AdversarialMotionPrior(nn.Module):
 
 
 def resolve_amp_config(alg_cfg: dict, env) -> dict:
-    """Resolve the AMP configuration, similar to resolve_rnd_config.
-
-    Modifies alg_cfg in place to include derived AMP parameters.
+    """Resolve the AMP configuration and defaults.
 
     - Sets 'time_between_frames' from env.unwrapped.step_dt if not provided.
-    - Optionally sets default replay buffer size if not provided.
-    - Allows optional env feature keys via 'env_obs_keys' in amp_cfg.
-
-    Args:
-        alg_cfg: The algorithm configuration dictionary (with optional 'amp_cfg').
-        env: The environment (used for step_dt and expert obs extraction).
-
-    Returns:
-        The resolved algorithm configuration dictionary.
+    - Sets 'replay_buffer_size' if not provided.
+    - Accepts pass-through keys for AmpFeatureExtractor such as:
+        'env_obs_keys', 'window_size', 'window_transform', 'fft_keep',
+        'pad_initial', 'require_full_window', 'use_joint_pos', 'use_joint_vel', 'use_end_pos'.
     """
     if "amp_cfg" in alg_cfg and alg_cfg["amp_cfg"] is not None:
         amp_cfg = alg_cfg["amp_cfg"]
-        # time between frames defaults to environment step dt
+        # time between frames defaults to env step dt
         if "time_between_frames" not in amp_cfg or amp_cfg["time_between_frames"] is None:
-            # prefer unwrapped if available
             step_dt = getattr(getattr(env, "unwrapped", env), "step_dt", None)
             if step_dt is None:
                 raise ValueError("AMP requires 'time_between_frames' or env.step_dt to be set.")
@@ -653,8 +808,5 @@ def resolve_amp_config(alg_cfg: dict, env) -> dict:
         # default replay buffer size
         if "replay_buffer_size" not in amp_cfg or amp_cfg["replay_buffer_size"] is None:
             amp_cfg["replay_buffer_size"] = amp_cfg.get("num_preload_transitions", 1_000_000)
-        # pass through env obs keys if runner config defines them (optional)
-        if "env_obs_keys" in amp_cfg and amp_cfg["env_obs_keys"] is not None:
-            # nothing to resolve; accepted by AdversarialMotionPrior
-            pass
+        # no further resolution required; windowing and keys are passed to AdversarialMotionPrior
     return alg_cfg
