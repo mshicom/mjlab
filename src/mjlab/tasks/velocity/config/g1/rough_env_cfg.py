@@ -9,11 +9,6 @@ from mjlab.tasks.velocity.velocity_env_cfg import (
 )
 from mjlab.utils.spec_config import ContactSensorCfg
 
-# NEW: AMP features
-from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm
-from mjlab.amp.obs_terms import AmpFeatureObs
-from mjlab.amp.config import AmpFeatureSetCfg, FeatureTermCfg
-
 
 @dataclass
 class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
@@ -71,42 +66,7 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.curriculum.command_vel = None
 
     # NEW: enable AMP observation term with a minimal feature set
-    self.observations.policy.amp = term(
-      ObsTerm,
-      func=AmpFeatureObs,
-      params={
-        "feature_set": AmpFeatureSetCfg(
-          terms=[
-            # Joint velocity RMS over a short window
-            FeatureTermCfg(
-              name="joint_speed_rms",
-              source="qvel",
-              channels=["scalar"],
-              window_size=30,
-              pre_diff="none",
-              aggregators=["rms"],
-            ),
-            # Yaw-rate RMS from base angular velocity
-            FeatureTermCfg(
-              name="yaw_rate_rms",
-              source="base_ang",
-              channels=["ang.z"],
-              window_size=30,
-              aggregators=["rms"],
-            ),
-            # Foot-ground duty (L/R)
-            FeatureTermCfg(
-              name="duty_left_right",
-              source="contacts",
-              channels=["binary"],
-              window_size=50,
-              aggregators=["mean"],
-            ),
-          ]
-        ),
-        "sensor_names": sensor_names,
-      },
-    )
+    self.observations.policy.amp.params["sensor_names"] = sensor_names
 
 
 @dataclass

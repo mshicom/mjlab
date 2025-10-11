@@ -24,13 +24,10 @@ from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-# NEW: AMP obs term import and a tiny default feature set
-from mjlab.amp.obs_terms import AmpFeatureObs
+from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm, EventTermCfg as EventTerm
+from mjlab.amp.obs_terms import amp_features_reset
 from mjlab.amp.config import AmpFeatureSetCfg, FeatureTermCfg
-
-##
-# Scene.
-##
+from mjlab.amp.obs_terms import amp_features_obs
 
 SCENE_CFG = SceneCfg(
   terrain=TerrainImporterCfg(
@@ -115,9 +112,42 @@ class ObservationCfg:
     command: ObsTerm = term(
       ObsTerm, func=mdp.generated_commands, params={"command_name": "twist"}
     )
-
-    # NEW: optional AMP features term (disabled by default; configure in robot-specific cfg)
-    amp: ObsTerm | None = None
+    # Optional AMP features term to be defined in robot-specific cfg as a function:
+    amp: ObsTerm | None = term(
+      ObsTerm,
+      func=amp_features_obs,
+      params={
+        "feature_set": AmpFeatureSetCfg(
+          terms=[
+            # Joint velocity RMS over a short window
+            FeatureTermCfg(
+              name="joint_speed_rms",
+              source="qvel",
+              channels=["scalar"],
+              window_size=30,
+              pre_diff="none",
+              aggregators=["rms"],
+            ),
+            # Yaw-rate RMS from base angular velocity
+            FeatureTermCfg(
+              name="yaw_rate_rms",
+              source="base_ang",
+              channels=["ang.z"],
+              window_size=30,
+              aggregators=["rms"],
+            ),
+            # Foot-ground duty (L/R)
+            FeatureTermCfg(
+              name="duty_left_right",
+              source="contacts",
+              channels=["binary"],
+              window_size=50,
+              aggregators=["mean"],
+            ),
+          ]
+        ),
+      },
+    )
 
     def __post_init__(self):
       self.enable_corruption = True
@@ -170,6 +200,12 @@ class EventCfg:
       "field": "geom_friction",
       "ranges": (0.3, 1.2),
     },
+  )
+  # Hook the AMP buffer reset into the reset event pipeline.
+  reset_amp_obs: EventTerm | None = term(
+    EventTerm,
+    func=amp_features_reset, 
+    mode="reset"
   )
 
 
@@ -228,7 +264,6 @@ class CurriculumCfg:
   terrain_levels: CurrTerm | None = term(
     CurrTerm, func=mdp.terrain_levels_vel, params={"command_name": "twist"}
   )
-
   command_vel: CurrTerm | None = term(
     CurrTerm,
     func=mdp.commands_vel,

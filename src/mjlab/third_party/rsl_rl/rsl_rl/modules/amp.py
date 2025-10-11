@@ -5,14 +5,13 @@
 
 from __future__ import annotations
 
-from typing import Generator, Iterable, Tuple
+from typing import Iterable
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch import autograd
 
-from mjlab.amp.config import AmpCfg, AmpDatasetCfg, AmpFeatureSetCfg
+from mjlab.amp.config import AmpDatasetCfg, AmpFeatureSetCfg
 from mjlab.amp.loader import AmpMotionLoader
 from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.storage import ReplayBuffer
@@ -87,9 +86,6 @@ class AdversarialMotionPrior(nn.Module):
         # Loader config (new)
         feature_set: AmpFeatureSetCfg | None = None,
         dataset_cfg: AmpDatasetCfg | None = None,
-        # Legacy passthroughs (kept for API)
-        time_between_frames: float | None = None,
-        preload_transitions: bool = False,
         num_preload_transitions: int = 1_000_000,
         motion_files: list[str] | None = None,
         # Replay buffer
