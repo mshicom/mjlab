@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch import autograd
 
-from mjlab.amp.config import AmpDatasetCfg, AmpFeatureSetCfg
+from mjlab.amp.config import AmpCfg, AmpDatasetCfg, AmpFeatureSetCfg
 from mjlab.amp.loader import AmpMotionLoader
 from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.storage import ReplayBuffer
@@ -82,32 +82,22 @@ class AdversarialMotionPrior(nn.Module):
         self,
         reward_coef: float,
         discr_hidden_dims: list[int],
-        task_reward_lerp: float = 0.0,
-        # Loader config (new)
-        feature_set: AmpFeatureSetCfg | None = None,
-        dataset_cfg: AmpDatasetCfg | None = None,
-        num_preload_transitions: int = 1_000_000,
-        motion_files: list[str] | None = None,
-        # Replay buffer
-        replay_buffer_size: int | None = None,
+        task_reward_lerp: float,
+        feature_set: AmpFeatureSetCfg,
+        dataset: AmpDatasetCfg,
+        replay_buffer_size: int = 10000,
         # Optimization / regularization
-        state_normalization: bool = True,
+        state_normalization: bool = False,
         grad_penalty_lambda: float = 10.0,
-        # Env extras keys
-        env_obs_keys: Iterable[str] | None = None,
         # Device
         device: str = "cpu",
+        **kwargs,
     ):
         super().__init__()
         self.device = device
-        self.env_obs_keys = tuple(env_obs_keys) if env_obs_keys is not None else ("amp_observations", "amp_obs", "amp_state", "amp")
 
         # Expert loader
-        if feature_set is None or dataset_cfg is None:
-            # Backward-compatible path: accept motion_files (must be Trajectory npz)
-            dataset_cfg = dataset_cfg or AmpDatasetCfg(files=motion_files or [])
-            feature_set = feature_set or AmpFeatureSetCfg(terms=[])
-        self.loader = AmpMotionLoader(dataset_cfg, feature_set, device=device)
+        self.loader = AmpMotionLoader(dataset, feature_set, device=device)
         observation_dim = int(self.loader.observation_dim)
 
         # Normalizer
@@ -123,8 +113,6 @@ class AdversarialMotionPrior(nn.Module):
         ).to(device)
 
         # Replay buffer for policy transitions
-        if replay_buffer_size is None:
-            replay_buffer_size = num_preload_transitions
         self.replay = ReplayBuffer(observation_dim, replay_buffer_size, device)
 
         # Coefficients
@@ -160,15 +148,8 @@ class AdversarialMotionPrior(nn.Module):
     def expert_generator(self, num_batches: int, batch_size: int):
         return self.loader.feed_forward_generator(num_batches, batch_size)
 
-    def _from_env_extras(self, extras: dict) -> torch.Tensor | None:
-        for key in self.env_obs_keys:
-            if key in extras:
-                val = extras[key]
-                return val if torch.is_tensor(val) else torch.as_tensor(val, dtype=torch.float32, device=self.device)
-        return None
-
     def update_from_env_extras(self, extras: dict, dones: torch.Tensor | None = None):
-        curr_feat = self._from_env_extras(extras)
+        curr_feat = extras["amp_observations"]
         if curr_feat is None:
             return
         if curr_feat.ndim == 1:
@@ -193,6 +174,35 @@ class AdversarialMotionPrior(nn.Module):
         self._env_prev_has.fill_(True)  # type: ignore
         self._env_prev_has[done_mask] = False  # type: ignore
 
+    def compute_batch_losses(
+            self,
+            policy_state: torch.Tensor,
+            policy_next_state: torch.Tensor,
+            expert_state: torch.Tensor,
+            expert_next_state: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+            """Compute discriminator/adversarial losses and stats."""
+            # Optional normalization
+            if self.normalizer is not None:
+                with torch.no_grad():
+                    policy_state = self.normalizer.normalize_torch(policy_state, self.device)
+                    policy_next_state = self.normalizer.normalize_torch(policy_next_state, self.device)
+                    expert_state = self.normalizer.normalize_torch(expert_state, self.device)
+                    expert_next_state = self.normalizer.normalize_torch(expert_next_state, self.device)
+
+            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+
+            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
+            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones_like(policy_d))
+            amp_loss = 0.5 * (expert_loss + policy_loss)
+
+            grad_pen_loss = self.discriminator.compute_grad_pen(
+                expert_state, expert_next_state, lambda_=self.grad_penalty_lambda
+            )
+
+            return amp_loss, grad_pen_loss, policy_d.mean().item(), expert_d.mean().item()
+    
     def reset_env_buffer(self):
         self._env_prev_feat = None
         self._env_prev_has = None
@@ -277,12 +287,6 @@ def resolve_amp_config(alg_cfg: dict, env) -> dict:
       - replay_buffer_size defaults to num_preload_transitions.
     """
     if "amp_cfg" in alg_cfg and alg_cfg["amp_cfg"] is not None:
-        amp_cfg = alg_cfg["amp_cfg"]
-        if "time_between_frames" not in amp_cfg or amp_cfg["time_between_frames"] is None:
-            step_dt = getattr(getattr(env, "unwrapped", env), "step_dt", None)
-            if step_dt is None:
-                raise ValueError("AMP requires 'time_between_frames' or env.step_dt to be set.")
-            amp_cfg["time_between_frames"] = float(step_dt)
-        if "replay_buffer_size" not in amp_cfg or amp_cfg["replay_buffer_size"] is None:
-            amp_cfg["replay_buffer_size"] = amp_cfg.get("num_preload_transitions", 1_000_000)
+        amp_cfg:AmpCfg = alg_cfg["amp_cfg"]
+       
     return alg_cfg

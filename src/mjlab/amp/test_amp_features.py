@@ -3,8 +3,7 @@ import numpy as np
 import torch
 
 from mjlab.amp.config import AmpFeatureSetCfg, FeatureTermCfg
-from mjlab.amp.feature_manager import FeatureManager
-from mjlab.amp.feature_terms import savgol_smooth, time_deriv, spectral_entropy
+from mjlab.amp.feature_manager import FeatureManager, savgol_smooth, time_deriv, spectral_entropy
 from mjlab.amp.loader import AmpMotionLoader
 
 

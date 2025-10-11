@@ -67,16 +67,68 @@ def amp_features_obs(
     if state is None:
         state = _init_amp_obs_state(env, feature_set, sensor_names)
         setattr(env, "_amp_obs_state", state)
+        return torch.zeros(env.num_envs, state["manager"].catalog.out_dim, device=env.device)
 
-    qvel = mdp.joint_vel_rel(env)        # [N, Dq]
-    base_lin = mdp.base_lin_vel(env)     # [N, 3]
-    base_ang = mdp.base_ang_vel(env)     # [N, 3]
-    contacts = _compute_contacts(env, state["sensor_names"])  # [N, K]
-
-    _append_frame(state["buffers"]["qvel"], qvel)
-    _append_frame(state["buffers"]["base_lin"], base_lin)
-    _append_frame(state["buffers"]["base_ang"], base_ang)
-    _append_frame(state["buffers"]["contacts"], contacts)
+    asset = env.scene["robot"]
+    required_sources = state["required_sources"]
+    
+    # Collect data for all required sources
+    if "qvel" in required_sources:
+        qvel = mdp.joint_vel_rel(env)
+        _append_frame(state["buffers"]["qvel"], qvel)
+    
+    if "qpos" in required_sources:
+        qpos = mdp.joint_pos_rel(env)
+        _append_frame(state["buffers"]["qpos"], qpos)
+    
+    if "base_lin" in required_sources:
+        base_lin = mdp.base_lin_vel(env)
+        _append_frame(state["buffers"]["base_lin"], base_lin)
+    
+    if "base_ang" in required_sources:
+        base_ang = mdp.base_ang_vel(env)
+        _append_frame(state["buffers"]["base_ang"], base_ang)
+    
+    if "contacts" in required_sources:
+        contacts = _compute_contacts(env, state["sensor_names"])
+        _append_frame(state["buffers"]["contacts"], contacts)
+    
+    if "xpos" in required_sources:
+        # Body positions: [N, nbody, 3] -> flatten to [N, nbody*3]
+        body_ids = asset.data.indexing.body_ids
+        xpos = asset.data.data.xpos[:, body_ids, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["xpos"], xpos)
+    
+    if "xquat" in required_sources:
+        # Body quaternions: [N, nbody, 4] -> flatten to [N, nbody*4]
+        body_ids = asset.data.indexing.body_ids
+        xquat = asset.data.data.xquat[:, body_ids, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["xquat"], xquat)
+    
+    if "cvel" in required_sources:
+        # Body velocities: [N, nbody, 6] -> flatten to [N, nbody*6]
+        body_ids = asset.data.indexing.body_ids
+        cvel = asset.data.data.cvel[:, body_ids, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["cvel"], cvel)
+    
+    if "subtree_com" in required_sources:
+        # Subtree COM: [N, nbody, 3] -> flatten to [N, nbody*3]
+        body_ids = asset.data.indexing.body_ids
+        subtree_com = asset.data.data.subtree_com[:, body_ids, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["subtree_com"], subtree_com)
+    
+    if "site_xpos" in required_sources:
+        # Site positions: [N, nsite, 3] -> flatten to [N, nsite*3]
+        site_ids = asset.data.indexing.site_ids
+        site_xpos = asset.data.data.site_xpos[:, site_ids, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["site_xpos"], site_xpos)
+    
+    if "site_xmat" in required_sources:
+        # Site rotation matrices: [N, nsite, 3, 3] -> flatten to [N, nsite*9]
+        site_ids = asset.data.indexing.site_ids
+        site_xmat = asset.data.data.site_xmat[:, site_ids, :, :].reshape(env.num_envs, -1)
+        _append_frame(state["buffers"]["site_xmat"], site_xmat)
+    
     state["filled"].clamp_(max=state["window_size_max"]).add_(1)
 
     windows = state["buffers"]
@@ -135,23 +187,74 @@ def _init_amp_obs_state(env: ManagerBasedRlEnv, feature_set: AmpFeatureSetCfg, s
     qvel_dim = _qvel_dim(env)
     joint_names = _get_joint_names(env, qvel_dim)
     joint_name2ind_qvel = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(joint_names)}
+    
+    # Get body and site names from the asset
+    asset = env.scene["robot"]
+    body_names = list(asset.body_names) if hasattr(asset, "body_names") else []
+    site_names = list(asset.site_names) if hasattr(asset, "site_names") else []
+    
+    body_name2ind = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(body_names)}
+    site_name2ind = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(site_names)}
+    
     env_info = _EnvInfo(
         joint_names=joint_names,
         joint_name2ind_qvel=joint_name2ind_qvel,
-        body_names=[], body_name2ind={},
-        site_names=[], site_name2ind={},
+        body_names=body_names, 
+        body_name2ind=body_name2ind,
+        site_names=site_names, 
+        site_name2ind=site_name2ind,
     )
 
     manager = FeatureManager(feature_set)
     meta = {"contacts_names": sensor_names} if sensor_names else None
     manager.resolve(env_info, device, meta=meta)
 
-    buffers = {
-        "qvel": torch.zeros(N, window_size_max, qvel_dim, device=device),
-        "base_lin": torch.zeros(N, window_size_max, 3, device=device),
-        "base_ang": torch.zeros(N, window_size_max, 3, device=device),
-        "contacts": torch.zeros(N, window_size_max, max(1, len(sensor_names or [])), device=device),
-    }
+    # Determine which sources are actually used
+    required_sources = set(t.source for t in feature_set.terms)
+    
+    # Create buffers for all required sources
+    buffers = {}
+    
+    if "qvel" in required_sources:
+        buffers["qvel"] = torch.zeros(N, window_size_max, qvel_dim, device=device)
+    
+    if "qpos" in required_sources:
+        qpos_dim = _qpos_dim(env)
+        buffers["qpos"] = torch.zeros(N, window_size_max, qpos_dim, device=device)
+    
+    if "base_lin" in required_sources:
+        buffers["base_lin"] = torch.zeros(N, window_size_max, 3, device=device)
+    
+    if "base_ang" in required_sources:
+        buffers["base_ang"] = torch.zeros(N, window_size_max, 3, device=device)
+    
+    if "contacts" in required_sources:
+        buffers["contacts"] = torch.zeros(N, window_size_max, max(1, len(sensor_names or [])), device=device)
+    
+    if "xpos" in required_sources:
+        nbody = len(body_names)
+        buffers["xpos"] = torch.zeros(N, window_size_max, nbody * 3, device=device)
+    
+    if "xquat" in required_sources:
+        nbody = len(body_names)
+        buffers["xquat"] = torch.zeros(N, window_size_max, nbody * 4, device=device)
+    
+    if "cvel" in required_sources:
+        nbody = len(body_names)
+        buffers["cvel"] = torch.zeros(N, window_size_max, nbody * 6, device=device)
+    
+    if "subtree_com" in required_sources:
+        nbody = len(body_names)
+        buffers["subtree_com"] = torch.zeros(N, window_size_max, nbody * 3, device=device)
+    
+    if "site_xpos" in required_sources:
+        nsite = len(site_names)
+        buffers["site_xpos"] = torch.zeros(N, window_size_max, nsite * 3, device=device)
+    
+    if "site_xmat" in required_sources:
+        nsite = len(site_names)
+        buffers["site_xmat"] = torch.zeros(N, window_size_max, nsite * 9, device=device)
+    
     filled = torch.zeros(N, dtype=torch.long, device=device)
     return {
         "manager": manager,
@@ -160,6 +263,7 @@ def _init_amp_obs_state(env: ManagerBasedRlEnv, feature_set: AmpFeatureSetCfg, s
         "dt": dt,
         "window_size_max": window_size_max,
         "sensor_names": sensor_names or [],
+        "required_sources": required_sources,
     }
 
 
@@ -190,6 +294,17 @@ def _compute_contacts(env: ManagerBasedRlEnv, sensor_names: List[str]) -> torch.
 
 def _qvel_dim(env: ManagerBasedRlEnv) -> int:
     asset = env.scene["robot"]
+    return asset.num_joints
+
+
+def _qpos_dim(env: ManagerBasedRlEnv) -> int:
+    asset = env.scene["robot"]
+    # qpos includes position for all joints; for free joint it's 7 (3 pos + 4 quat)
+    # For other joints it depends on joint type
+    if hasattr(asset, 'num_bodies'):
+        # Approximate: assume similar structure to qvel but may differ
+        # Better approach: get from data.qpos shape
+        return asset.data.qpos.shape[1]
     return asset.num_joints
 
 

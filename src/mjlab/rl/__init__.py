@@ -3,6 +3,9 @@ from mjlab.rl.config import (
   RslRlOnPolicyRunnerCfg,
   RslRlPpoActorCriticCfg,
   RslRlPpoAlgorithmCfg,
+  RslRlSymmetryCfg,
+  RslRlRndCfg,
+  RslRlPpoAmpCfg,  
 )
 from mjlab.rl.vecenv_wrapper import RslRlVecEnvWrapper
 
@@ -12,4 +15,7 @@ __all__ = (
   "RslRlBaseRunnerCfg",
   "RslRlOnPolicyRunnerCfg",
   "RslRlVecEnvWrapper",
+  "RslRlSymmetryCfg",
+  "RslRlRndCfg",
+  "RslRlPpoAmpCfg",
 )

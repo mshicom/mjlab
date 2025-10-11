@@ -10,7 +10,6 @@ from mjlab.utils.dataset.traj_class import Trajectory
 from mjlab.amp.config import AmpDatasetCfg, AmpFeatureSetCfg, SymmetryAugmentCfg
 from mjlab.amp.feature_manager import FeatureManager
 
-
 class AmpMotionLoader:
     """
     Trajectory npz-based expert feature loader using FeatureManager.
@@ -30,7 +29,7 @@ class AmpMotionLoader:
 
     def __init__(self, dataset_cfg: AmpDatasetCfg, feature_set: AmpFeatureSetCfg, device: str):
         self.dataset_cfg = dataset_cfg
-        self.feature_set = feature_set
+        self.feature_set = feature_set 
         self.device = torch.device(device)
 
         self.trajs: List[Trajectory] = []

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field, MISSING
 from typing import ClassVar, Literal, Tuple
+from mjlab.amp.config import AmpCfg
 
 @dataclass
 class RslRlSymmetryCfg:
@@ -64,21 +65,8 @@ class RslRlRndCfg:
   target_hidden_dims: Tuple[int] = (-1)
   """The hidden dimensions for the RND target network. Default is [-1]."""
 
-@dataclass
-class RslRlPpoAmpCfg:
-  reward_coef: float = 0.5
-  """Coefficient to scale the AMP reward."""
-  motion_files: list[str] = field(default_factory=list)
-  """The list of motion files for AMP."""
-  num_preload_transitions: int = 200000
-  """The number of transitions to preload before training."""
-  discr_hidden_dims: Tuple[int, ...] = (1024, 512, 256)
-  """The hidden dimensions of the AMP discriminator MLP network."""
-  task_reward_lerp: float = 0.0
-  """Interpolation factor between AMP reward and task reward.
-  Defaults to 0.0 (only AMP reward)."""
-  min_normalized_std: Tuple[int, ...] = (0.05) * 20
-  """The minimum normalized standard deviation for AMP."""
+
+RslRlPpoAmpCfg = AmpCfg  # alias for clarity
   
   
 @dataclass

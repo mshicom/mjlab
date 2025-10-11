@@ -40,14 +40,7 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
 
     self.actions.joint_pos.scale = Z1_ACTION_SCALE
 
-    self.rewards.air_time.params["sensor_names"] = sensor_names
-    # self.rewards.pose.params["std"] = {
-    #   r"^(left|right)_knee_joint$": 0.6,
-    #   r"^(left|right)_hip_pitch_joint$": 0.6,
-    #   r"^(left|right)_elbow_joint$": 0.6,
-    #   r"^(left|right)_shoulder_pitch_joint$": 0.6,
-    #   r"^(?!.*(knee_joint|hip_pitch|elbow_joint|shoulder_pitch)).*$": 0.3,
-    # }
+    self.rewards.feet_slide.params["sensor_names"] = sensor_names
     self.rewards.pose.params["std"] = {
       # Lower body.
       r".*hip_pitch.*": 0.3,
@@ -87,4 +80,4 @@ class NuBotZ1RoughEnvCfg_PLAY(NuBotZ1RoughEnvCfg):
         self.scene.terrain.terrain_generator.curriculum = False
         self.scene.terrain.terrain_generator.num_cols = 5
         self.scene.terrain.terrain_generator.num_rows = 5
-        self.scene.terrain.terrain_generator.border_width = 10.0
+        self.scene.terrain.terrain_generator.border_width = 100.0

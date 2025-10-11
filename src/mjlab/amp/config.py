@@ -64,7 +64,6 @@ class FeatureTermCfg:
     - channels: semantics for channel selection within a modality. Interpreted by the selector in FeatureManager.
                 Examples: ["scalar"], ["ang.z"], ["lin.speed"]. The skeleton gathers indices directly.
     - window_size: temporal window length (number of frames) for this term.
-    - hop: used by offline dataset sampling if you implement strided batching (unused in current skeleton).
     - savgol: whether to apply Savitzky–Golay smoothing before differencing.
     - pre_diff: order of time difference (velocity/acceleration/jerk) applied after smoothing.
     - aggregators: list of aggregation ops over time ("rms", "mean", etc.). "flatten" retains time.
@@ -74,7 +73,6 @@ class FeatureTermCfg:
     source: SignalSource
     channels: list[str] = field(default_factory=list)
     window_size: int = 20
-    hop: int = 1
     savgol: SavgolMode = "poly2_w5"
     pre_diff: PreDiff = "none"
     aggregators: list[Aggregator] = field(default_factory=lambda: ["rms"])
@@ -165,8 +163,9 @@ class AmpCfg:
     reward_coef: float = 0.5
     discr_hidden_dims: tuple[int, ...] = (1024, 512, 256)
     task_reward_lerp: float = 0.0
-    feature_set: AmpFeatureSetCfg | None = None
-    dataset: AmpDatasetCfg | None = None
-    replay_buffer_size: int | None = None
+    feature_set: AmpFeatureSetCfg = field(default_factory=AmpFeatureSetCfg)
+    dataset: AmpDatasetCfg = field(default_factory=AmpDatasetCfg)
+    replay_buffer_size: int = 10000
     state_normalization: bool = True
     grad_penalty_lambda: float = 10.0
+    learning_rate: float = 1e-3  # learning rate for the discriminator optimizer

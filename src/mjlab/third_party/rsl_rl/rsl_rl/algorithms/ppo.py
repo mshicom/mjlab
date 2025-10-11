@@ -15,7 +15,14 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.modules.amp import AdversarialMotionPrior
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
+from mjlab.amp.config import AmpCfg
+from dataclasses import is_dataclass, fields
 
+def asdict_shallow(obj):
+    if not is_dataclass(obj):
+        raise TypeError("asdict_shallow() should be called on a dataclass instance")
+    # Works for regular and slots=True dataclasses
+    return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -43,7 +50,7 @@ class PPO:
         # RND parameters
         rnd_cfg: dict | None = None,
         # AMP parameters
-        amp_cfg: dict | None = None,
+        amp_cfg: AmpCfg | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
@@ -72,8 +79,8 @@ class PPO:
 
         # AMP components
         if amp_cfg is not None:
-            amp_lr = amp_cfg.pop("learning_rate", 1e-3)
-            self.amp = AdversarialMotionPrior(device=self.device, **amp_cfg)
+            amp_lr = amp_cfg.learning_rate
+            self.amp = AdversarialMotionPrior(device=self.device, **asdict_shallow(amp_cfg))
             # two param groups with weight decay for trunk/head
             amp_params = [
                 {"params": self.amp.discriminator.trunk.parameters(), "weight_decay": 1.0e-3},

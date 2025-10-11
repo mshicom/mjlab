@@ -2,7 +2,7 @@ import os
 
 import wandb
 from rsl_rl.runners import OnPolicyRunner
-
+from dataclasses import asdict
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.velocity.rl.exporter import (
   attach_onnx_metadata,
@@ -12,6 +12,13 @@ from mjlab.tasks.velocity.rl.exporter import (
 
 class VelocityOnPolicyRunner(OnPolicyRunner):
   env: RslRlVecEnvWrapper
+  def __init__(self, env: RslRlVecEnvWrapper, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    # copy amp_cfg from env.cfg to train_cfg to enable AMP training
+    if env.cfg.amp_cfg is not None:
+      train_cfg["algorithm"]["amp_cfg"] = env.cfg.amp_cfg
+
+    super().__init__(env, train_cfg, log_dir, device)
+    
 
   def save(self, path: str, infos=None):
     """Save the model and training information."""
