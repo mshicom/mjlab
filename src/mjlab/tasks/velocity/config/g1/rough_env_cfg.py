@@ -9,6 +9,11 @@ from mjlab.tasks.velocity.velocity_env_cfg import (
 )
 from mjlab.utils.spec_config import ContactSensorCfg
 
+# NEW: AMP features
+from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm
+from mjlab.amp.obs_terms import AmpFeatureObs
+from mjlab.amp.config import AmpFeatureSetCfg, FeatureTermCfg
+
 
 @dataclass
 class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
@@ -37,17 +42,9 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
       geom_names.append(f"right_foot{i}_collision")
 
     self.events.foot_friction.params["asset_cfg"].geom_names = geom_names
-
     self.actions.joint_pos.scale = G1_ACTION_SCALE
-
     self.rewards.air_time.params["sensor_names"] = sensor_names
-    # self.rewards.pose.params["std"] = {
-    #   r"^(left|right)_knee_joint$": 0.6,
-    #   r"^(left|right)_hip_pitch_joint$": 0.6,
-    #   r"^(left|right)_elbow_joint$": 0.6,
-    #   r"^(left|right)_shoulder_pitch_joint$": 0.6,
-    #   r"^(?!.*(knee_joint|hip_pitch|elbow_joint|shoulder_pitch)).*$": 0.3,
-    # }
+
     self.rewards.pose.params["std"] = {
       # Lower body.
       r".*hip_pitch.*": 0.3,
@@ -72,6 +69,44 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.commands.twist.viz.z_offset = 0.75
 
     self.curriculum.command_vel = None
+
+    # NEW: enable AMP observation term with a minimal feature set
+    self.observations.policy.amp = term(
+      ObsTerm,
+      func=AmpFeatureObs,
+      params={
+        "feature_set": AmpFeatureSetCfg(
+          terms=[
+            # Joint velocity RMS over a short window
+            FeatureTermCfg(
+              name="joint_speed_rms",
+              source="qvel",
+              channels=["scalar"],
+              window_size=30,
+              pre_diff="none",
+              aggregators=["rms"],
+            ),
+            # Yaw-rate RMS from base angular velocity
+            FeatureTermCfg(
+              name="yaw_rate_rms",
+              source="base_ang",
+              channels=["ang.z"],
+              window_size=30,
+              aggregators=["rms"],
+            ),
+            # Foot-ground duty (L/R)
+            FeatureTermCfg(
+              name="duty_left_right",
+              source="contacts",
+              channels=["binary"],
+              window_size=50,
+              aggregators=["mean"],
+            ),
+          ]
+        ),
+        "sensor_names": sensor_names,
+      },
+    )
 
 
 @dataclass

@@ -24,6 +24,10 @@ from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
+# NEW: AMP obs term import and a tiny default feature set
+from mjlab.amp.obs_terms import AmpFeatureObs
+from mjlab.amp.config import AmpFeatureSetCfg, FeatureTermCfg
+
 ##
 # Scene.
 ##
@@ -46,11 +50,6 @@ VIEWER_CONFIG = ViewerConfig(
   elevation=-5.0,
   azimuth=90.0,
 )
-
-##
-# MDP.
-##
-
 
 @dataclass
 class ActionCfg:
@@ -112,11 +111,13 @@ class ObservationCfg:
       func=mdp.joint_vel_rel,
       noise=Unoise(n_min=-1.5, n_max=1.5),
     )
-
     actions: ObsTerm = term(ObsTerm, func=mdp.last_action)
     command: ObsTerm = term(
       ObsTerm, func=mdp.generated_commands, params={"command_name": "twist"}
     )
+
+    # NEW: optional AMP features term (disabled by default; configure in robot-specific cfg)
+    amp: ObsTerm | None = None
 
     def __post_init__(self):
       self.enable_corruption = True
@@ -198,7 +199,6 @@ class RewardCfg:
   dof_pos_limits: RewardTerm = term(RewardTerm, func=mdp.joint_pos_limits, weight=-1.0)
   action_rate_l2: RewardTerm = term(RewardTerm, func=mdp.action_rate_l2, weight=-0.1)
 
-  # Unused, only here as an example.
   air_time: RewardTerm = term(
     RewardTerm,
     func=mdp.feet_air_time,
@@ -241,10 +241,6 @@ class CurriculumCfg:
   )
 
 
-##
-# Environment.
-##
-
 SIM_CFG = SimulationCfg(
   nconmax=140_000,
   njmax=300,
@@ -272,7 +268,6 @@ class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
   episode_length_s: float = 20.0
 
   def __post_init__(self):
-    # Enable curriculum mode for terrain generator.
     if self.scene.terrain is not None:
       if self.scene.terrain.terrain_generator is not None:
         self.scene.terrain.terrain_generator.curriculum = True

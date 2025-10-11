@@ -14,7 +14,7 @@ from collections import deque
 
 import rsl_rl
 # Use the updated PPO with AMP/RND/Symmetry integration
-from rsl_rl.modules.new_ppo import PPO
+from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.modules.amp import resolve_amp_config
@@ -108,7 +108,7 @@ class OnPolicyRunner:
                     # Move to device
                     obs_next, rewards, dones = (obs_next.to(self.device), rewards.to(self.device), dones.to(self.device))
 
-                    # AMP: let the AMP module extract features and add transitions (hides previous feature state)
+                    # AMP: env observation term writes extras["amp_observations"]; AMP module pairs (prev, curr)
                     if hasattr(self.alg, "amp") and self.alg.amp is not None:
                         self.alg.amp.update_from_env_extras(extras, dones)
 

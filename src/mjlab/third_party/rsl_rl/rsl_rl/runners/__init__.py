@@ -7,6 +7,5 @@
 
 from .on_policy_runner import OnPolicyRunner  # isort:skip
 from .distillation_runner import DistillationRunner
-from .amp_on_policy_runner import AmpOnPolicyRunner
 
-__all__ = ["OnPolicyRunner", "DistillationRunner", "AmpOnPolicyRunner"]
+__all__ = ["OnPolicyRunner", "DistillationRunner"]
