@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -61,8 +61,8 @@ class Discriminator(nn.Module):
         with torch.no_grad():
             self.eval()
             if normalizer is not None:
-                state = normalizer.normalize_torch(state, state.device)
-                next_state = normalizer.normalize_torch(next_state, next_state.device)
+                state = normalizer(state)
+                next_state = normalizer(next_state)
             d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
             reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             if self.task_reward_lerp > 0:
@@ -73,7 +73,7 @@ class Discriminator(nn.Module):
 
 class AdversarialMotionPrior(nn.Module):
     """
-    New AMP that:
+    AMP:
       - consumes per-step env features from extras["amp_observations"]
       - uses Trajectory npz + FeatureManager via AmpMotionLoader for expert batches
     """
@@ -89,6 +89,11 @@ class AdversarialMotionPrior(nn.Module):
         # Optimization / regularization
         state_normalization: bool = False,
         grad_penalty_lambda: float = 10.0,
+        # New: control grad penalty frequency (compute every K calls)
+        amp_grad_pen_interval: int = 1,
+        # New: decouple AMP training batch schedule from PPO (optional)
+        amp_num_mini_batches: Optional[int] = None,
+        amp_batch_size: Optional[int] = None,
         # Device
         device: str = "cpu",
         **kwargs,
@@ -96,9 +101,10 @@ class AdversarialMotionPrior(nn.Module):
         super().__init__()
         self.device = device
 
-        # Expert loader
+        # Expert loader (CPU-based sampling to avoid VRAM spikes)
         self.loader = AmpMotionLoader(dataset, feature_set, device=device)
         observation_dim = int(self.loader.observation_dim)
+        self.observation_dim = observation_dim  # keep for serialization
 
         # Normalizer
         self.normalizer = EmpiricalNormalization(observation_dim) if state_normalization else None
@@ -119,6 +125,14 @@ class AdversarialMotionPrior(nn.Module):
         self.reward_coef = reward_coef
         self.loss_coef = reward_coef
         self.grad_penalty_lambda = grad_penalty_lambda
+
+        # AMP grad penalty frequency
+        self.amp_grad_pen_interval = max(1, int(amp_grad_pen_interval))
+        self._amp_update_step = 0
+
+        # AMP batch schedule (optional)
+        self.amp_num_mini_batches = amp_num_mini_batches
+        self.amp_batch_size = amp_batch_size
 
         # Previous env feature to build (s, s_next)
         self._env_prev_feat: torch.Tensor | None = None
@@ -142,14 +156,19 @@ class AdversarialMotionPrior(nn.Module):
     def add_transition(self, state: torch.Tensor, next_state: torch.Tensor):
         self.replay.insert(state, next_state)
 
-    def policy_generator(self, num_batches: int, batch_size: int):
-        return self.replay.feed_forward_generator(num_batches, batch_size)
+    # Convenience generators that use decoupled AMP schedule when args are None
+    def policy_generator(self, num_batches: int | None = None, batch_size: int | None = None):
+        nb = num_batches if num_batches is not None else (self.amp_num_mini_batches or 1)
+        bs = batch_size if batch_size is not None else (self.amp_batch_size or 1024)
+        return self.replay.feed_forward_generator(nb, bs)
 
-    def expert_generator(self, num_batches: int, batch_size: int):
-        return self.loader.feed_forward_generator(num_batches, batch_size)
+    def expert_generator(self, num_batches: int | None = None, batch_size: int | None = None):
+        nb = num_batches if num_batches is not None else (self.amp_num_mini_batches or 1)
+        bs = batch_size if batch_size is not None else (self.amp_batch_size or 1024)
+        return self.loader.feed_forward_generator(nb, bs)
 
     def update_from_env_extras(self, extras: dict, dones: torch.Tensor | None = None):
-        curr_feat = extras["amp_observations"]
+        curr_feat = extras.get("amp_observations", None)
         if curr_feat is None:
             return
         if curr_feat.ndim == 1:
@@ -175,34 +194,49 @@ class AdversarialMotionPrior(nn.Module):
         self._env_prev_has[done_mask] = False  # type: ignore
 
     def compute_batch_losses(
-            self,
-            policy_state: torch.Tensor,
-            policy_next_state: torch.Tensor,
-            expert_state: torch.Tensor,
-            expert_next_state: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
-            """Compute discriminator/adversarial losses and stats."""
-            # Optional normalization
-            if self.normalizer is not None:
-                with torch.no_grad():
-                    policy_state = self.normalizer.normalize_torch(policy_state, self.device)
-                    policy_next_state = self.normalizer.normalize_torch(policy_next_state, self.device)
-                    expert_state = self.normalizer.normalize_torch(expert_state, self.device)
-                    expert_next_state = self.normalizer.normalize_torch(expert_next_state, self.device)
+        self,
+        policy_state: torch.Tensor,
+        policy_next_state: torch.Tensor,
+        expert_state: torch.Tensor,
+        expert_next_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+        """
+        Compute discriminator/adversarial losses and stats with optional empirical normalization.
 
-            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
-            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+        Normalization:
+          - Update running moments on the union of current batches (no grad).
+          - Use module forward to normalize each tensor.
 
-            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
-            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones_like(policy_d))
-            amp_loss = 0.5 * (expert_loss + policy_loss)
+        Grad penalty:
+          - Computed every amp_grad_pen_interval steps to reduce overhead.
+        """
+        if self.normalizer is not None:
+            with torch.no_grad():
+                all_states = torch.cat([policy_state, policy_next_state, expert_state, expert_next_state], dim=0)
+                self.normalizer.update(all_states)
+            ps = self.normalizer(policy_state)
+            psn = self.normalizer(policy_next_state)
+            es = self.normalizer(expert_state)
+            esn = self.normalizer(expert_next_state)
+        else:
+            ps, psn, es, esn = policy_state, policy_next_state, expert_state, expert_next_state
 
-            grad_pen_loss = self.discriminator.compute_grad_pen(
-                expert_state, expert_next_state, lambda_=self.grad_penalty_lambda
-            )
+        policy_d = self.discriminator(torch.cat([ps, psn], dim=-1))
+        expert_d = self.discriminator(torch.cat([es, esn], dim=-1))
 
-            return amp_loss, grad_pen_loss, policy_d.mean().item(), expert_d.mean().item()
-    
+        expert_loss = torch.nn.MSELoss()(expert_d, torch.ones_like(expert_d))
+        policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones_like(policy_d))
+        amp_loss = 0.5 * (expert_loss + policy_loss)
+
+        # Grad penalty schedule
+        self._amp_update_step += 1
+        if (self._amp_update_step % self.amp_grad_pen_interval) == 0:
+            grad_pen_loss = self.discriminator.compute_grad_pen(es, esn, lambda_=self.grad_penalty_lambda)
+        else:
+            grad_pen_loss = torch.zeros((), device=amp_loss.device, dtype=amp_loss.dtype)
+
+        return amp_loss, grad_pen_loss, policy_d.mean().item(), expert_d.mean().item()
+
     def reset_env_buffer(self):
         self._env_prev_feat = None
         self._env_prev_has = None
@@ -219,14 +253,15 @@ class AdversarialMotionPrior(nn.Module):
             "reward_coef": self.reward_coef,
             "loss_coef": self.loss_coef,
             "grad_penalty_lambda": self.grad_penalty_lambda,
-            "observation_dim": self.replay.obs_shape[0] if hasattr(self, "replay") else None,
+            "observation_dim": int(self.observation_dim),
         }
         # Normalizer stats (if enabled)
         if self.normalizer is not None:
             state["normalizer"] = {
                 "count": self.normalizer.count.clone().cpu(),
-                "mean": self.normalizer.mean.clone().cpu(),
-                "var": self.normalizer.var.clone().cpu(),
+                "_mean": self.normalizer._mean.clone().cpu(),
+                "_var": self.normalizer._var.clone().cpu(),
+                "_std": self.normalizer._std.clone().cpu(),
             }
         else:
             state["normalizer"] = None
@@ -235,15 +270,14 @@ class AdversarialMotionPrior(nn.Module):
         if include_replay and hasattr(self, "replay") and self.replay is not None:
             rb = self.replay
             state["replay"] = {
-                "size": int(rb.size),
-                "ptr": int(rb.ptr),
-                "obs": rb.obs.clone().cpu(),
-                "next_obs": rb.next_obs.clone().cpu(),
+                "num_samples": int(rb.num_samples),
+                "step": int(rb.step),
+                "states": rb.states.clone().cpu(),
+                "next_states": rb.next_states.clone().cpu(),
             }
         else:
             state["replay"] = None
 
-        # No need to persist expert loader contents; re-hydrated from dataset paths.
         return state
 
     def load_state_dict(self, state: dict, strict: bool = True):
@@ -257,36 +291,38 @@ class AdversarialMotionPrior(nn.Module):
         self.reward_coef = state.get("reward_coef", self.reward_coef)
         self.loss_coef = state.get("loss_coef", self.loss_coef)
         self.grad_penalty_lambda = state.get("grad_penalty_lambda", self.grad_penalty_lambda)
+        self.observation_dim = state.get("observation_dim", self.observation_dim)
 
         # Normalizer
         norm = state.get("normalizer", None)
         if norm is not None and self.normalizer is not None:
             with torch.no_grad():
                 self.normalizer.count.copy_(norm["count"].to(self.device))
-                self.normalizer.mean.copy_(norm["mean"].to(self.device))
-                self.normalizer.var.copy_(norm["var"].to(self.device))
+                self.normalizer._mean.copy_(norm["_mean"].to(self.device))
+                self.normalizer._var.copy_(norm["_var"].to(self.device))
+                self.normalizer._std.copy_(norm["_std"].to(self.device))
 
         # Replay buffer (optional)
         rb_state = state.get("replay", None)
         if rb_state is not None and hasattr(self, "replay") and self.replay is not None:
             rb = self.replay
             with torch.no_grad():
-                rb.obs.copy_(rb_state["obs"].to(self.device))
-                rb.next_obs.copy_(rb_state["next_obs"].to(self.device))
-                rb.size = rb_state["size"]
-                rb.ptr = rb_state["ptr"]
+                rb.states.copy_(rb_state["states"].to(self.device))
+                rb.next_states.copy_(rb_state["next_states"].to(self.device))
+                rb.num_samples = int(rb_state["num_samples"])
+                rb.step = int(rb_state["step"])
 
         # Clear env prev buffers (always recomputed on-the-fly)
         self.reset_env_buffer()
         return self
 
+
 def resolve_amp_config(alg_cfg: dict, env) -> dict:
     """
-    Resolve AMP config defaults:
-      - If amp_cfg is present, ensure time_between_frames exists (from env.step_dt).
-      - replay_buffer_size defaults to num_preload_transitions.
+    Resolve AMP config defaults.
+    - Pass through new fields for grad penalty interval and AMP batch schedule.
     """
     if "amp_cfg" in alg_cfg and alg_cfg["amp_cfg"] is not None:
-        amp_cfg:AmpCfg = alg_cfg["amp_cfg"]
-       
+        amp_cfg: AmpCfg | dict = alg_cfg["amp_cfg"]
+
     return alg_cfg

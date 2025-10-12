@@ -66,7 +66,7 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.curriculum.command_vel = None
 
     # NEW: enable AMP observation term with a minimal feature set
-    self.observations.policy.amp.params["sensor_names"] = sensor_names
+    self.observations.discriminator.amp.params["sensor_names"] = sensor_names
     self.amp_cfg.dataset.files = [
       "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz"
     ]

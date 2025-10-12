@@ -12,7 +12,7 @@ from mjlab.utils.dataset.traj_class import TrajectoryInfo
 
 @dataclass
 class FeatureCatalog:
-    terms: List[FeatureTerm]
+    terms: dict[str, FeatureTerm]
     out_dim: int
 
 
@@ -291,7 +291,7 @@ class FeatureManager:
       3) feats = manager.compute(windows_dict, dt)
     """
     def __init__(self, cfg: AmpFeatureSetCfg):
-        self.cfg = cfg if isinstance(cfg, AmpFeatureSetCfg) else AmpFeatureSetCfg(**cfg)
+        self.cfg = cfg 
         self.catalog: FeatureCatalog | None = None
         self._info: Optional[TrajectoryInfo] = None
         self._meta: Dict[str, object] = {}
@@ -402,8 +402,8 @@ class FeatureManager:
     # ---- internal: resolve using TrajectoryInfo ----
 
     def _build_terms_from_info(self, info: TrajectoryInfo, device: torch.device):
-        terms: List[FeatureTerm] = []
-        for tcfg in self.cfg.terms:
+        terms: list[FeatureTerm] = []
+        for k, tcfg in self.cfg.terms.items():
             idx = self._resolve_indices_from_info(tcfg, info, device)
             selector = build_selector(tcfg.source, idx, tcfg.channels, _GROUP_SIZE.get(tcfg.source, 1))
             term = FeatureTerm(cfg=tcfg, indices=idx, channel_selector=selector)
@@ -423,17 +423,17 @@ class FeatureManager:
         if src == "qpos":
             if sel.joints:
                 idxs = [torch.as_tensor(info.joint_name2ind_qpos[j], dtype=torch.long) for j in sel.joints if j in info.joint_name2ind_qpos]
+                assert idxs, f"No valid joints found in selection {sel.joints}"
             else:
-                # ALL qpos in order
-                idxs = [torch.arange(info.model.njnt * 0) ]  # dummy, replaced below
-                # flatten in order of joint_names
+                # ALL qpos
                 idxs = [torch.as_tensor(info.joint_name2ind_qpos[j], dtype=torch.long) for j in info.joint_names]
             return concat(idxs)
 
         if src == "qvel":
             if sel.joints:
                 idxs = [torch.as_tensor(info.joint_name2ind_qvel[j], dtype=torch.long) for j in sel.joints if j in info.joint_name2ind_qvel]
-            else:
+                assert idxs, f"No valid joints found in selection {sel.joints}"
+            else: # all joints if not specified
                 idxs = [torch.as_tensor(info.joint_name2ind_qvel[j], dtype=torch.long) for j in info.joint_names]
             return concat(idxs)
 

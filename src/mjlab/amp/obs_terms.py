@@ -10,6 +10,7 @@ from mjlab.amp.config import AmpFeatureSetCfg
 from mjlab.amp.feature_manager import FeatureManager
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.tasks.velocity import mdp
+from mjlab.entity import Entity
 
 
 @dataclass
@@ -68,7 +69,7 @@ def amp_features_obs(
         state = _init_amp_obs_state(env, feature_set, sensor_names)
         setattr(env, "_amp_obs_state", state)
         return torch.zeros(env.num_envs, state["manager"].catalog.out_dim, device=env.device)
-
+    #TODO: follow observations.py pattern and use passed-in asset_cfg: SceneEntityCfg to support multi-agent?
     asset = env.scene["robot"]
     required_sources = state["required_sources"]
     
@@ -182,17 +183,17 @@ def _init_amp_obs_state(env: ManagerBasedRlEnv, feature_set: AmpFeatureSetCfg, s
     device = torch.device(env.device)
     N = env.num_envs
     dt = env.step_dt
-    window_size_max = max(t.window_size for t in feature_set.terms)
+    window_size_max = max(t.window_size for t in feature_set.terms.values())
+    asset: Entity = env.scene["robot"]
 
-    qvel_dim = _qvel_dim(env)
-    joint_names = _get_joint_names(env, qvel_dim)
+    # Get joint, body and site names from the asset
+    # qvel here is missleading that it does not include 6 dof root joint
+    qvel_dim = asset.num_joints
+    joint_names = asset.joint_names
+    body_names = asset.body_names
+    site_names = asset.site_names
+    
     joint_name2ind_qvel = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(joint_names)}
-    
-    # Get body and site names from the asset
-    asset = env.scene["robot"]
-    body_names = list(asset.body_names) if hasattr(asset, "body_names") else []
-    site_names = list(asset.site_names) if hasattr(asset, "site_names") else []
-    
     body_name2ind = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(body_names)}
     site_name2ind = {nm: np.array([i], dtype=np.int64) for i, nm in enumerate(site_names)}
     
@@ -210,7 +211,7 @@ def _init_amp_obs_state(env: ManagerBasedRlEnv, feature_set: AmpFeatureSetCfg, s
     manager.resolve(env_info, device, meta=meta)
 
     # Determine which sources are actually used
-    required_sources = set(t.source for t in feature_set.terms)
+    required_sources = set(t.source for t in feature_set.terms.values())
     
     # Create buffers for all required sources
     buffers = {}
@@ -291,10 +292,6 @@ def _compute_contacts(env: ManagerBasedRlEnv, sensor_names: List[str]) -> torch.
         vals.append((sensor[:, 0] > 0).float())
     return torch.stack(vals, dim=1)
 
-
-def _qvel_dim(env: ManagerBasedRlEnv) -> int:
-    asset = env.scene["robot"]
-    return asset.num_joints
 
 
 def _qpos_dim(env: ManagerBasedRlEnv) -> int:

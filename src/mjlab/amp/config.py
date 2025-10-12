@@ -59,7 +59,6 @@ class FeatureTermCfg:
     Declarative configuration for one feature term in the FeatureManager.
 
     Fields:
-    - name: a unique label for this term (for debugging/logging).
     - source: which SignalSource to draw the time-series from.
     - channels: semantics for channel selection within a modality. Interpreted by the selector in FeatureManager.
                 Examples: ["scalar"], ["ang.z"], ["lin.speed"]. The skeleton gathers indices directly.
@@ -69,10 +68,9 @@ class FeatureTermCfg:
     - aggregators: list of aggregation ops over time ("rms", "mean", etc.). "flatten" retains time.
     - select: subset of named elements to include (resolved to indices via FeatureManager.resolve).
     """
-    name: str
     source: SignalSource
     channels: list[str] = field(default_factory=list)
-    window_size: int = 20
+    window_size: int = 10
     savgol: SavgolMode = "poly2_w5"
     pre_diff: PreDiff = "none"
     aggregators: list[Aggregator] = field(default_factory=lambda: ["rms"])
@@ -103,15 +101,15 @@ class AmpFeatureSetCfg:
     Collection of feature terms to be concatenated by FeatureManager.
 
     Fields:
-    - terms: list of FeatureTermCfg entries composing the final feature vector.
+    - terms: dict of FeatureTermCfg entries composing the final feature vector.
     - default_select: default selection applied to all terms unless overridden.
     - default_savgol: default smoothing option applied to all terms unless overridden.
     - normalize: optional toggle to apply an external normalizer at the consumer (e.g., AMP discriminator).
     Used by: FeatureManager (both env and offline).
     """
-    terms: list[FeatureTermCfg]
+    terms: dict[str, FeatureTermCfg]
     default_select: JointSelectionCfg = field(default_factory=JointSelectionCfg)
-    default_savgol: SavgolMode = "poly2_w5"
+    default_savgol: SavgolMode = "none"
     normalize: bool = False
 
 
@@ -161,11 +159,15 @@ class AmpCfg:
     Used by: rsl_rl.modules.amp.AdversarialMotionPrior
     """
     reward_coef: float = 0.5
-    discr_hidden_dims: tuple[int, ...] = (1024, 512, 256)
+    discr_hidden_dims: tuple[int, ...] = (512, 256)
     task_reward_lerp: float = 0.0
     feature_set: AmpFeatureSetCfg = field(default_factory=AmpFeatureSetCfg)
     dataset: AmpDatasetCfg = field(default_factory=AmpDatasetCfg)
-    replay_buffer_size: int = 10000
-    state_normalization: bool = True
+    replay_buffer_size: int = 2000
+    state_normalization: bool = False
     grad_penalty_lambda: float = 10.0
     learning_rate: float = 1e-3  # learning rate for the discriminator optimizer
+    amp_grad_pen_interval: int = 5  # interval (in policy updates) to update the AMP discriminator
+    amp_num_mini_batches: int = 4  # number of mini-batches to split the AMP batch into for discriminator updates
+    amp_batch_size: int = 256  # batch size of AMP transitions to use per discriminator update
+    

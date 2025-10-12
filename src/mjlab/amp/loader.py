@@ -23,6 +23,8 @@ class AmpMotionLoader:
         contacts: proxy from site_xpos z-height threshold for selected sites
     - Optionally apply symmetry augmentation (left/right swap + lateral sign flips).
     - Sample aligned multi-modality sliding windows and compute feature pairs (s, s_next).
+    - Memory safety: All heavy window sampling and feature computation runs on CPU,
+      then final features are moved to the target device (e.g., GPU) to avoid VRAM spikes.
 
     Used by: rsl_rl.modules.amp.AdversarialMotionPrior.expert_generator().
     """
@@ -30,7 +32,10 @@ class AmpMotionLoader:
     def __init__(self, dataset_cfg: AmpDatasetCfg, feature_set: AmpFeatureSetCfg, device: str):
         self.dataset_cfg = dataset_cfg
         self.feature_set = feature_set 
+        # Target device for outputs (e.g., "cuda:0")
         self.device = torch.device(device)
+        # Compute device for offline processing (always CPU to avoid OOM)
+        self.compute_device = torch.device("cpu")
 
         self.trajs: List[Trajectory] = []
         self.frequency: float = 0.0
@@ -51,7 +56,8 @@ class AmpMotionLoader:
     def _load_all(self):
         files = self.dataset_cfg.files or glob.glob("datasets/motion_traj/*.npz")
         for f in files:
-            self.trajs.append(Trajectory.load(f))
+            self.trajs.append(Trajectory.load(f, backend=np))
+            print(f"Loaded Loco_mujoco trajectory file: {f} of length {self.trajs[-1].data.qpos.shape[0]}")
         if not self.trajs:
             raise FileNotFoundError("No trajectory npz files found for AMP dataset.")
         self.frequency = float(self.trajs[0].info.frequency)
@@ -73,6 +79,7 @@ class AmpMotionLoader:
             self.modalities["base_lin"] = base_lin_list
             self.modalities["base_ang"] = base_ang_list
 
+        # TODO: this is not working and need reimplementation
         # contacts from site_xpos if we have site names
         site_names = getattr(self.trajs[0].info, "site_names", None)
         if "site_xpos" in self.modalities and self.modalities["site_xpos"] and site_names:
@@ -201,9 +208,9 @@ class AmpMotionLoader:
         return perm
 
     def _resolve_manager(self):
-        # Resolve using TrajectoryInfo; pass contacts_names for site-based contacts mapping if needed
+        # Resolve using TrajectoryInfo on CPU; pass contacts_names for contact channel ordering if needed
         meta = {"contacts_names": self.contacts_names} if self.contacts_names else None
-        self.manager.resolve(self.trajs[0].info, self.device, meta=meta)
+        self.manager.resolve(self.trajs[0].info, self.compute_device, meta=meta)
 
     @property
     def observation_dim(self) -> int:
@@ -212,24 +219,29 @@ class AmpMotionLoader:
 
     def _sample_windows(self, batch_size: int, window_size_max: int) -> Tuple[Dict[str, torch.Tensor], float]:
         """
-        Sample aligned windows of length T=window_size_max for every available modality.
-        Each batch row can come from a different trajectory and time index; time alignment across modalities
-        is done by taking the same [start:start+T] slice.
+        Sample aligned windows for only the modalities actually used by the configured feature terms.
+        All tensors are created on CPU to reduce GPU memory pressure.
 
         Returns:
-          windows: dict of source -> [B, T, D]
+          windows: dict of source -> [B, T, D] (CPU tensors)
           dt: seconds per frame (1/frequency)
         """
         B, T = batch_size, window_size_max
         windows: Dict[str, torch.Tensor] = {}
         dt = 1.0 / self.frequency
+
+        # Only sample sources required by the feature set
+        used_sources = {t.cfg.source for t in self.manager.catalog.terms}
+
         for src, per_traj in self.modalities.items():
+            if src not in used_sources:
+                continue
             if not per_traj:
                 continue
             xs = []
             for _ in range(B):
                 tid = np.random.randint(len(per_traj))
-                X = per_traj[tid]  # [N,D] or [N,n,C]; we flatten second dim if needed
+                X = per_traj[tid]  # [N,D] or [N,n,C]; flatten if needed
                 if X.ndim == 3:
                     N, n, C = X.shape
                     Xf = X.reshape(N, n * C)
@@ -242,23 +254,23 @@ class AmpMotionLoader:
                 else:
                     start = np.random.randint(0, N - T + 1)
                     seg = Xf[start:start + T]
-                xs.append(torch.from_numpy(seg).to(self.device, dtype=torch.float32))
+                xs.append(torch.from_numpy(seg).to(self.compute_device, dtype=torch.float32))
             windows[src] = torch.stack(xs, dim=0)
         return windows, dt
 
     def feed_forward_generator(self, num_batches: int, batch_size: int):
         """
         Generator yielding expert transition pairs (s, s_next) using sliding windows.
-        Windows are sampled with size Wmax+1 to produce consecutive pairs by shifting by 1.
-
-        Yields:
-          s: [B, F], s_next:[B, F]
+        Heavy lifting is done on CPU; final features are moved to target device.
         """
         Wmax = max(t.cfg.window_size for t in self.manager.catalog.terms)
         for _ in range(num_batches):
             windows, dt = self._sample_windows(batch_size, Wmax + 1)
-            s = self.manager.compute({k: v[:, :-1, :] for k, v in windows.items()}, dt)
-            s_next = self.manager.compute({k: v[:, 1:, :] for k, v in windows.items()}, dt)
+            s_cpu = self.manager.compute({k: v[:, :-1, :] for k, v in windows.items()}, dt)
+            s_next_cpu = self.manager.compute({k: v[:, 1:, :] for k, v in windows.items()}, dt)
+            # Move minimal tensors to target device
+            s = s_cpu.to(self.device, non_blocking=True)
+            s_next = s_next_cpu.to(self.device, non_blocking=True)
             yield s, s_next
 
     # ---- utilities for derived signals ----
