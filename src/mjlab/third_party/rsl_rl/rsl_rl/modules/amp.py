@@ -11,11 +11,10 @@ import torch
 import torch.nn as nn
 from torch import autograd
 
-from mjlab.amp.config import AmpCfg, AmpDatasetCfg, AmpFeatureSetCfg
-from mjlab.amp.loader import AmpMotionLoader
+from mjlab.amp.config import AmpCfg, AmpDatasetCfg
 from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.storage import ReplayBuffer
-
+from mjlab.utils.dataset.motion_dataset import MotionDataset
 
 class Discriminator(nn.Module):
     def __init__(self, input_dim: int, amp_reward_coef: float, hidden_layer_sizes: list[int], device: str, task_reward_lerp: float = 0.0):
@@ -83,7 +82,7 @@ class AdversarialMotionPrior(nn.Module):
         reward_coef: float,
         discr_hidden_dims: list[int],
         task_reward_lerp: float,
-        feature_set: AmpFeatureSetCfg,
+        observation_group: str,
         dataset: AmpDatasetCfg,
         replay_buffer_size: int = 10000,
         # Optimization / regularization

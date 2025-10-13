@@ -25,9 +25,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm, EventTermCfg as EventTerm
-from mjlab.amp.obs_terms import amp_features_reset
-from mjlab.amp.config import AmpCfg, AmpFeatureSetCfg, FeatureTermCfg, JointSelectionCfg, AmpDatasetCfg, SymmetryAugmentCfg
-from mjlab.amp.obs_terms import amp_features_obs
+from mjlab.amp.config import AmpCfg, AmpDatasetCfg, SymmetryAugmentCfg
 
 SCENE_CFG = SceneCfg(
   terrain=TerrainImporterCfg(
@@ -78,129 +76,22 @@ class CommandsCfg:
     ),
   )
 
-AMP_CFG = AmpCfg(
-  reward_coef=0.5,
-  discr_hidden_dims=(1024, 512, 256),
-  task_reward_lerp=0.0,
-  feature_set=AmpFeatureSetCfg(
-    terms={
-      # RMS of joint speed/accel/jerk on informative joints
-      "joint_speed_rms": FeatureTermCfg(
-        source="qvel",
-        channels=["scalar"],  # interpret as scalar per selected DOF
-        window_size=4,
-        pre_diff="none",
-        aggregators=["rms"],
-        select=JointSelectionCfg(joints=[
-          "left_hip_pitch_joint", 
-          "left_knee_joint", 
-          "right_hip_pitch_joint", 
-          "right_knee_joint", 
-          "left_elbow_joint", 
-          "left_wrist_roll_joint", 
-          "right_elbow_joint"
-          "right_wrist_roll_joint", 
-        ]),
-      ),
-      # FeatureTermCfg(
-      #   name="joint_accel_rms",
-      #   source="qvel",
-      #   channels=["scalar"],
-      #   window_size=12,
-      #   pre_diff="acceleration",
-      #   aggregators=["rms"],
-      #   select=JointSelectionCfg(joints=["left_knee", "right_knee", "left_ankle", "right_ankle", "left_wrist", "right_wrist", "left_elbow", "right_elbow"]),
-      # ),
-      # FeatureTermCfg(
-      #   name="joint_jerk_rms",
-      #   source="qvel",
-      #   channels=["scalar"],
-      #   window_size=12,
-      #   pre_diff="jerk",
-      #   aggregators=["rms"],
-      #   select=JointSelectionCfg(joints=["left_knee", "right_knee", "left_ankle", "right_ankle", "left_wrist", "right_wrist", "left_elbow", "right_elbow"]),
-      # ),
-      # Global energy proxy: mean speed^2 of selected bodies (or full robot)
-      "energy_proxy": FeatureTermCfg(
-        source="cvel",  # body 6D velocities; use linear components
-        channels=["lin.x", "lin.y", "lin.z"],  # assume selector will pick linear parts
-        window_size=4,
-        aggregators=["mean"],  # mean of squared speed can be implemented in term or via pre_diff mode
-        select=JointSelectionCfg(bodies=["pelvis", "torso_link"]),
-      ),
-      # Foot-ground duty (L/R) and transition rate
-      # FeatureTermCfg(
-      #   name="duty_left",
-      #   source="site_xpos",  # or derive from contacts; see preprocessing
-      #   channels=["z<eps->contact"],  # custom channel routine in selector
-      #   window_size=50,
-      #   aggregators=["mean"],  # mean(contact) ~= duty factor
-      #   select=JointSelectionCfg(sites=["left_foot"]),
-      # ),
-      # FeatureTermCfg(
-      #   name="duty_right",
-      #   source="site_xpos",
-      #   channels=["z<eps->contact"],
-      #   window_size=50,
-      #   aggregators=["mean"],
-      #   select=JointSelectionCfg(sites=["right_foot"]),
-      # ),
-      # FeatureTermCfg(
-      #   name="contact_transition_rate",
-      #   source="site_xpos",
-      #   channels=["z<eps->contact"],
-      #   window_size=50,
-      #   aggregators=["rms"],  # rms of diff(contact) ~ transition rate
-      #   pre_diff="velocity",
-      #   select=JointSelectionCfg(sites=["left_foot", "right_foot"]),
-      # ),
-      # Left-right symmetry: ankle & wrist speed correlations
-      # FeatureTermCfg(
-      #   name="lr_symmetry_ankle_wrist",
-      #   source="cvel",
-      #   channels=["lin.speed"],  # add "speed" support in selector
-      #   window_size=12,
-      #   aggregators=["mean"],  # implement correlation in term: replace "mean" with dedicated "corr" agg in your code
-      #   select=JointSelectionCfg(bodies=["left_ankle", "right_ankle", "left_wrist", "right_wrist"]),
-      # ),
-      # # Upper-lower limb coordination
-      # FeatureTermCfg(
-      #   name="upper_lower_coord",
-      #   source="cvel",
-      #   channels=["lin.speed"],
-      #   window_size=12,
-      #   aggregators=["mean"],  # implement cross-correlation or phase-lock value as a new agg if desired
-      #   select=JointSelectionCfg(bodies=["left_wrist", "right_wrist", "left_ankle", "right_ankle"]),
-      # ),
-      # # Yaw-rate RMS (from shoulders/hips or pelvis angular z)
-      # FeatureTermCfg(
-      #   name="yaw_rate_rms",
-      #   source="cvel",
-      #   channels=["ang.z"],
-      #   window_size=12,
-      #   aggregators=["rms"],
-      #   select=JointSelectionCfg(bodies=["pelvis"]),
-      # ),
-      # # Dominant frequency + spectral entropy of COM vertical velocity
-      # FeatureTermCfg(
-      #   name="com_vert_freq",
-      #   source="subtree_com",
-      #   channels=["lin.z"],  # z component of COM position
-      #   window_size=12,
-      #   pre_diff="velocity",  # differentiate to get velocity
-      #   aggregators=["dominant_freq", "spectral_entropy"],
-      #   select=JointSelectionCfg(bodies=["pelvis"]),  # or a virtual COM index
-      # ),
-    },
-  ),
-  dataset=AmpDatasetCfg(
-    files=[], # Override in robot cfg.
-    time_between_frames=0.05,
-    preload_transitions=200_000,
-    symmetry=SymmetryAugmentCfg(enabled=False),
-  ),
-)
-
+if 0:
+  AMP_CFG = AmpCfg(
+    reward_coef=0.5,
+    discr_hidden_dims=(1024, 512, 256),
+    task_reward_lerp=0.0,
+    observation_group="discriminator",  # feed this observation group to the discriminator
+    dataset=AmpDatasetCfg(
+      files=[], # Override in robot cfg.
+      time_between_frames=0.05,
+      preload_transitions=200_000,
+      symmetry=SymmetryAugmentCfg(enabled=False),
+    ),
+  )
+else:
+  AMP_CFG = None
+  
 @dataclass
 class ObservationCfg:
   @dataclass
@@ -244,22 +135,27 @@ class ObservationCfg:
       super().__post_init__()
       self.enable_corruption = False
       
-  # Optional AMP features term to be defined in robot-specific cfg as a function:
+
   @dataclass
-  class DiscriminatorCfg(ObsGroup):
-    amp: ObsTerm | None = term(
+  class DiscriminatorGroupCfg(ObsGroup):
+    # qpos history of selected joints.
+    qpos: ObsTerm = term(
       ObsTerm,
-      func=amp_features_obs,
+      func=mdp.joint_pos_abs,
+      hist_window_size=2,
+      hist_func=mdp.aggregate_cat,
       params={
-        "feature_set": AMP_CFG.feature_set,
-        "sensor_names": [],  # Override in robot cfg.
-      },
+        "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),   # override in robot cfg.
+      }
     )
-      
+         
 
   policy: PolicyCfg = field(default_factory=PolicyCfg)
   critic: PrivilegedCfg = field(default_factory=PrivilegedCfg)
-  discriminator: DiscriminatorCfg = field(default_factory=DiscriminatorCfg)
+  # discriminator = DiscriminatorGroupCfg(
+  #   concatenate_terms = True,
+  #   enable_corruption =False,
+  # )
 
 
 @dataclass
@@ -301,12 +197,7 @@ class EventCfg:
       "ranges": (0.3, 1.2),
     },
   )
-  # Hook the AMP buffer reset into the reset event pipeline.
-  reset_amp_obs: EventTerm | None = term(
-    EventTerm,
-    func=amp_features_reset, 
-    mode="reset"
-  )
+
 
 
 @dataclass
