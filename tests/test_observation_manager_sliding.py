@@ -129,14 +129,15 @@ def test_hist_value_smoothing_and_hist_shapes():
     assert term.shape == (N, J)
     assert torch.allclose(term, torch.full((N, J), latest, device=env.device, dtype=torch.float32), atol=1e-4)
 
-    # get_term_hist returns a SlidingWindow and its _get_hist_data returns (T_hist, N, J)
+    # get_term_hist returns a SlidingWindow and its _get_hist_data returns (N, J, T_hist) by default
     hist = om.get_term_hist("base_pos", group="base")
     assert hist is not None
-    seq = hist._get_hist_data(window_size=5)  # replicate_pad=False by default
-    assert seq.shape == (5, N, J)
-    # Check chronological ordering matches the last 5 values of the ramp (raw tail)
-    expected_tail = torch.stack([torch.full((N, J), b + s * t, device=env.device) for t in range(T - 5, T)], dim=0)
-    assert torch.allclose(seq, expected_tail, atol=1e-6)
+    seq = hist._get_hist_data(window_size=5)  # default layout NCW: (N, J, 5)
+    assert seq.shape == (N, J, 5)
+    # Check chronological ordering matches the last 5 values of the ramp
+    expected_tail_tnc = torch.stack([torch.full((N, J), b + s * t, device=env.device) for t in range(T - 5, T)], dim=0)  # (5, N, J)
+    expected_tail_ncw = expected_tail_tnc.permute(1, 2, 0).contiguous()  # (N, J, 5)
+    assert torch.allclose(seq, expected_tail_ncw, atol=1e-6)
 
 
 def test_hist_derivative_linear_exact():
@@ -245,14 +246,15 @@ def test_partial_reset_replicate_padding_in_manager():
     hist = om.get_term_hist("base_pos", group="base")
     assert hist is not None
     # Request replicate_pad=True to apply per-env replicate padding at the head
-    seq = hist._get_hist_data(window_size=4, replicate_pad=True)  # (T=4, N, C)
+    seq = hist._get_hist_data(window_size=4, replicate_pad=True)  # (N, J, T=4)
 
     # For reset envs: valid_len=1 -> pad_len = 3, head should be replicated with 10.0
-    assert torch.allclose(seq[:3, 1, :], torch.full((3, J), 10.0, device=env.device))
-    assert torch.allclose(seq[:3, 3, :], torch.full((3, J), 10.0, device=env.device))
-    # For non-reset envs (0,2): chronological tail should be [1,2,3,10]
-    assert torch.allclose(seq[:, 0, :], torch.tensor([[1.0], [2.0], [3.0], [10.0]], device=env.device).repeat(1, J))
-    assert torch.allclose(seq[:, 2, :], torch.tensor([[1.0], [2.0], [3.0], [10.0]], device=env.device).repeat(1, J))
+    assert torch.allclose(seq[1, :, :3], torch.full((J, 3), 10.0, device=env.device).T)
+    assert torch.allclose(seq[3, :, :3], torch.full((J, 3), 10.0, device=env.device).T)
+    # For non-reset envs (0,2): chronological tail should be [1,2,3,10] along last dim
+    expected = torch.tensor([1.0, 2.0, 3.0, 10.0], device=env.device).view(1, 1, 4).repeat(1, J, 1)  # (1, J, 4)
+    assert torch.allclose(seq[0:1, :, :], expected, atol=1e-6)
+    assert torch.allclose(seq[2:3, :, :], expected, atol=1e-6)
 
 
 def test_multiple_terms_concatenation_and_get_term_slices():

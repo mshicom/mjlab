@@ -127,12 +127,11 @@ def test_motion_dataset_with_real_unitree_g1_dataset():
   
   cfg = UnitreeG1FlatEnvCfg()
   env = ManagerBasedRlEnv(cfg, device="cpu")
-  om = env.observation_manager
 
   # Build MotionDataset and precompute
   md = MotionDataset(
     mj_model=env.sim.mj_model,
-    obs_manager=om,
+    obs_manager=env.observation_manager,
     trajectories=[TrajectorySpec(path=real_path, weight=1.5)],
     device="cpu",
   )

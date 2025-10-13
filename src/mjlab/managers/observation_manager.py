@@ -16,13 +16,18 @@ from mjlab.utils.sliding_window import SlidingWindow
 class ObservationManager(ManagerBase):
   def __init__(self, cfg: object, env):
     self.cfg = cfg
-    super().__init__(env=env)
 
     self._group_obs_dim: dict[str, tuple[int, ...] | list[tuple[int, ...]]] = dict()
+    # Sliding window instances (per group -> per term)
+    self._sliding_windows: dict[str, dict[str, SlidingWindow]] = {}
+    # Map of per-term output dims (post-aggregation) and raw dims (pre-aggregation)
+    self._group_obs_term_raw_dim: dict[str, list[tuple[int, ...]]] = {}
 
+    super().__init__(env=env)
+    
+    # Compute final per-group dims for presentation/concatenation
     for group_name, group_term_dims in self._group_obs_term_dim.items():
       if self._group_obs_concatenate[group_name]:
-        # All observation terms will be concatenated.
         try:
           term_dims = torch.stack(
             [torch.tensor(dims, device="cpu") for dims in group_term_dims], dim=0
@@ -43,49 +48,25 @@ class ObservationManager(ManagerBase):
             f"Unable to concatenate observation terms in group {group_name}."
           ) from None
       else:
-        # Observation terms will be returned as a dictionary; we will store a
-        # list of their dimensions.
         self._group_obs_dim[group_name] = group_term_dims
 
     self._obs_buffer: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None
 
-    # Sliding window instances (per group -> per term)
-    self._sliding_windows: dict[str, dict[str, SlidingWindow]] = {
-      g: {} for g in self._group_obs_term_names.keys()
-    }
-
-    # For fast get_term on concatenated groups: precompute slice offsets
-    self._group_term_slices: dict[str, dict[str, slice]] = {}
+    # Initialize sliding windows (only for enabled terms), using RAW dims (pre-aggregation)
+    self._sliding_windows = {g: {} for g in self._group_obs_term_names.keys()}
     for group_name in self._group_obs_term_names.keys():
-      if self._group_obs_concatenate[group_name]:
-        offsets: dict[str, slice] = {}
-        start = 0
-        for name, shp in zip(
+      for idx, (term_name, term_cfg) in enumerate(
+        zip(
           self._group_obs_term_names[group_name],
-          self._group_obs_term_dim[group_name],
+          self._group_obs_term_cfgs[group_name],
           strict=False,
-        ):
-          length = int(np.prod(shp))
-          offsets[name] = slice(start, start + length)
-          start += length
-        self._group_term_slices[group_name] = offsets
-
-    # Initialize sliding windows (only for enabled terms)
-    for group_name in self._group_obs_term_names.keys():
-      for term_name, term_cfg in zip(
-        self._group_obs_term_names[group_name],
-        self._group_obs_term_cfgs[group_name],
-        strict=False,
+        )
       ):
         if term_cfg.hist_window_size > 0:
-          feat_shape = torch.Size(
-            self._group_obs_term_dim[group_name][
-              self._group_obs_term_names[group_name].index(term_name)
-            ]
-          )
+          raw_feat_shape = torch.Size(self._group_obs_term_raw_dim[group_name][idx])
           self._sliding_windows[group_name][term_name] = SlidingWindow(
             num_envs=self._env.num_envs,
-            feature_shape=feat_shape,
+            feature_shape=raw_feat_shape,
             max_window_size=term_cfg.hist_window_size,
             device=torch.device(self._env.device),
           )
@@ -144,8 +125,6 @@ class ObservationManager(ManagerBase):
 
     return terms
 
-  # Properties.
-
   @property
   def active_terms(self) -> dict[str, list[str]]:
     return self._group_obs_term_names
@@ -162,10 +141,7 @@ class ObservationManager(ManagerBase):
   def group_obs_concatenate(self) -> dict[str, bool]:
     return self._group_obs_concatenate
 
-  # Methods.
-
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> dict[str, float]:
-    # Call reset only if the term func implements it
     for _group_name, group_cfg in self._group_obs_class_term_cfgs.items():
       for term_cfg in group_cfg:
         if hasattr(term_cfg.func, "reset"):
@@ -173,7 +149,6 @@ class ObservationManager(ManagerBase):
     for mod in self._group_obs_class_instances.values():
       mod.reset(env_ids=env_ids)
 
-    # Reset sliding windows (partial or global)
     for group_windows in self._sliding_windows.values():
       for win in group_windows.values():
         win.reset(env_ids=env_ids)
@@ -194,19 +169,16 @@ class ObservationManager(ManagerBase):
     )
     for term_name, term_cfg in obs_terms:
       # 1) Compute raw per-step observation from source function.
-      # If a hist_func is provided, treat func as a pure source (no hist params).
-      func_kwargs = {} if term_cfg.hist_func is not None else term_cfg.params
-      obs_raw: torch.Tensor = term_cfg.func(self._env, **func_kwargs).clone()
+      # Always pass params at runtime (per request).
+      obs_raw: torch.Tensor = term_cfg.func(self._env, **term_cfg.params).clone()
 
       # 2) If sliding window enabled, push raw sample and optionally aggregate via hist_func.
       sw = self._sliding_windows[group_name].get(term_name, None)
       if sw is not None:
         sw.push(obs_raw)
         if term_cfg.hist_func is not None:
-          # Aggregator is responsible for producing final tensor for this term.
           obs = term_cfg.hist_func(self._env, sw, **term_cfg.params)
         else:
-          # Default aggregation: pass-through last raw value.
           obs = obs_raw
       else:
         obs = obs_raw
@@ -230,7 +202,6 @@ class ObservationManager(ManagerBase):
     return group_obs
 
   def get_term(self, term_name: str, group: str | None = None) -> torch.Tensor:
-    """Return the current computed tensor for a given observation term."""
     if self._obs_buffer is None:
       self.compute()
     assert self._obs_buffer is not None
@@ -252,15 +223,6 @@ class ObservationManager(ManagerBase):
     return buf[:, slc]
 
   def get_term_hist(self, term_name: str, group: str | None = None) -> SlidingWindow | None:
-    """Expose the underlying SlidingWindow for a term, if enabled.
-
-    Args:
-      term_name: Term name within its group.
-      group: Optional group name. If None, term_name must be unique across groups.
-
-    Returns:
-      SlidingWindow instance if the term has hist_window_size>0, else None.
-    """
     if group is None:
       groups_with_term = [g for g, names in self._group_obs_term_names.items() if term_name in names]
       assert len(groups_with_term) == 1, "term_name must be unique or specify group"
@@ -277,6 +239,7 @@ class ObservationManager(ManagerBase):
     self._group_obs_concatenate: dict[str, bool] = dict()
     self._group_obs_concatenate_dim: dict[str, int] = dict()
     self._group_obs_class_instances: dict[str, noise_model.NoiseModel] = {}
+    self._group_term_slices: dict[str, dict[str, slice]] = {}
 
     group_cfg_items = get_terms(self.cfg, ObservationGroupCfg).items()
     for group_name, group_cfg in group_cfg_items:
@@ -285,10 +248,11 @@ class ObservationManager(ManagerBase):
         continue
       group_cfg: ObservationGroupCfg
 
-      self._group_obs_term_names[group_name] = list()
-      self._group_obs_term_dim[group_name] = list()
-      self._group_obs_term_cfgs[group_name] = list()
-      self._group_obs_class_term_cfgs[group_name] = list()
+      self._group_obs_term_names[group_name] = []
+      self._group_obs_term_dim[group_name] = []
+      self._group_obs_term_raw_dim[group_name] = []
+      self._group_obs_term_cfgs[group_name] = []
+      self._group_obs_class_term_cfgs[group_name] = []
 
       self._group_obs_concatenate[group_name] = group_cfg.concatenate_terms
       self._group_obs_concatenate_dim[group_name] = (
@@ -307,24 +271,64 @@ class ObservationManager(ManagerBase):
 
         if not group_cfg.enable_corruption:
           term_cfg.noise = None
+
+        # Register term
         self._group_obs_term_names[group_name].append(term_name)
         self._group_obs_term_cfgs[group_name].append(term_cfg)
 
-        # When hist_func is provided, don't pass hist params into func for shape inference.
-        probe_kwargs = {} if term_cfg.hist_func is not None else term_cfg.params
-        obs_dims = tuple(term_cfg.func(self._env, **probe_kwargs).shape)
-        self._group_obs_term_dim[group_name].append(obs_dims[1:])
+        # 1) Probe RAW feature dims via func, passing params
+        raw_sample = term_cfg.func(self._env, **term_cfg.params)
+        assert isinstance(raw_sample, torch.Tensor), f"Observation func '{term_name}' must return a Tensor"
+        raw_dims = tuple(raw_sample.shape[1:])
+        self._group_obs_term_raw_dim[group_name].append(raw_dims)
 
-        # Prepare noise model classes.
-        if term_cfg.noise is not None and isinstance(
-          term_cfg.noise, noise_cfg.NoiseModelCfg
+        # 2) Infer OUTPUT dims:
+        #    If hist_func present and hist_window_size>0, pre-fill a temp SlidingWindow with raw samples
+        #    (using same params) then call hist_func(env, temp_sw, **params) to get output shape.
+        if term_cfg.hist_func is not None and term_cfg.hist_window_size > 0:
+          temp_sw = SlidingWindow(
+            num_envs=self._env.num_envs,
+            feature_shape=torch.Size(raw_dims),
+            max_window_size=term_cfg.hist_window_size,
+            device=torch.device(self._env.device),
+          )
+          for _ in range(term_cfg.hist_window_size):
+            temp_sw.push(raw_sample)
+          agg_sample = term_cfg.hist_func(self._env, temp_sw, **term_cfg.params)
+          assert isinstance(agg_sample, torch.Tensor), f"hist_func for '{term_name}' must return a Tensor"
+          out_dims = tuple(agg_sample.shape[1:])
+        else:
+          out_dims = raw_dims
+
+        self._group_obs_term_dim[group_name].append(out_dims)
+
+      # Precompute slices for concatenated groups
+      if self._group_obs_concatenate[group_name]:
+        offsets: dict[str, slice] = {}
+        start = 0
+        for name, shp in zip(
+          self._group_obs_term_names[group_name],
+          self._group_obs_term_dim[group_name],
+          strict=False,
         ):
+          length = int(np.prod(shp))
+          offsets[name] = slice(start, start + length)
+          start += length
+        self._group_term_slices[group_name] = offsets
+
+    # Prepare noise model classes last
+    for group_name in self._group_obs_term_names.keys():
+      for term_name, term_cfg in zip(
+        self._group_obs_term_names[group_name],
+        self._group_obs_term_cfgs[group_name],
+        strict=False,
+      ):
+        if term_cfg.noise is not None and isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
           noise_model_cls = term_cfg.noise.class_type
           assert issubclass(noise_model_cls, noise_model.NoiseModel), (
             f"Class type for observation term '{term_name}' NoiseModelCfg"
             f" is not a subclass of 'NoiseModel'. Received: '{type(noise_model_cls)}'."
           )
-          # Create and store noise model instance.
           self._group_obs_class_instances[term_name] = noise_model_cls(
             term_cfg.noise, num_envs=self._env.num_envs, device=self._env.device
           )

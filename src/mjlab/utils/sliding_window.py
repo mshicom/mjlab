@@ -55,9 +55,10 @@ class SlidingWindow(torch.nn.Module):
   API:
     - push(x): x is (N, C_flat)
     - reset(env_ids: Optional[Tensor|slice]): partial or global reset
-    - _get_hist_data(window_size: int, replicate_pad: bool = False) -> (T, N, C_flat)
-      - replicate_pad=False (default): fast slice with optional zero-left-pad after global reset
-      - replicate_pad=True: additionally apply per-env replicate padding based on last partial reset
+    - _get_hist_data(window_size: int, replicate_pad: bool = False, layout: str = "NCW")
+      - layout="NCW" (default): returns (N, C, W)
+      - layout="TNC": returns (T, N, C)
+      replicate_pad applies per-env replicate padding when True.
     - _get_hist_data_smooth_and_diffed(window_size, diff_order, diff_dt, poly_degree=2)
       Returns (N, C_flat); applies per-env replicate padding internally.
 
@@ -100,7 +101,6 @@ class SlidingWindow(torch.nn.Module):
   # State management
   # ----------------
 
-  @torch.no_grad()
   def reset(self, env_ids: Optional[torch.Tensor | slice] = None) -> None:
     """Reset history. If env_ids is None, global reset; else, per-env partial reset."""
     if env_ids is None:
@@ -117,7 +117,6 @@ class SlidingWindow(torch.nn.Module):
   # Push
   # ----
 
-  @torch.no_grad()
   def push(self, x: Tensor) -> None:
     """Push newest observation x: (N, C_flat)."""
     # Minimal runtime checks for hot path
@@ -136,7 +135,6 @@ class SlidingWindow(torch.nn.Module):
   # Read helpers
   # ------------
 
-  @torch.no_grad()
   def _slice_tail(self, T_req: int) -> Tensor:
     """Return chronological tail as (T_req, N, C), zero-left-padded after global reset as needed.
     No per-env replicate padding here.
@@ -162,7 +160,6 @@ class SlidingWindow(torch.nn.Module):
 
     return seq  # (T_req, N, C)
 
-  @torch.no_grad()
   def _apply_per_env_replicate_pad(self, seq_TNC: Tensor, T_req: int) -> Tensor:
     """Apply per-env replicate padding to seq_TNC (T_req, N, C) using last_reset_step and self._step."""
     if T_req == 0:
@@ -197,24 +194,33 @@ class SlidingWindow(torch.nn.Module):
   # Public read API
   # ---------------
 
-  @torch.no_grad()
-  def _get_hist_data(self, window_size: int, replicate_pad: bool = False) -> Tensor:
-    """Return chronological tail as (T, N, C_flat).
+  def _get_hist_data(self, window_size: int, replicate_pad: bool = False, layout: str = "NCW") -> Tensor:
+    """Return history tail.
 
     Args:
       window_size: desired history length T (<= max_window_size).
-      replicate_pad: if True, apply per-env replicate padding at the head based on partial resets.
-                     Defaults to False for max throughput.
+      replicate_pad: if True, apply per-env replicate padding at the head for partial resets.
+      layout: "NCW" (default) for (N, C, W) or "TNC" for (T, N, C).
+
+    Returns:
+      Tensor shaped per layout:
+        - (N, C, W) if layout="NCW"
+        - (T, N, C) if layout="TNC"
     """
     if window_size < 1:
       raise AssertionError("window_size must be >= 1")
     T_req = min(window_size, self.max_window_size)
-    seq = self._slice_tail(T_req)
+    seq_tnc = self._slice_tail(T_req)
     if replicate_pad and T_req > 0:
-      seq = self._apply_per_env_replicate_pad(seq, T_req)
-    return seq
+      seq_tnc = self._apply_per_env_replicate_pad(seq_tnc, T_req)
 
-  @torch.no_grad()
+    if layout.upper() == "TNC":
+      return seq_tnc
+    elif layout.upper() == "NCW":
+      return seq_tnc.permute(1, 2, 0).contiguous()
+    else:
+      raise ValueError("layout must be 'NCW' or 'TNC'")
+
   def _get_hist_data_smooth_and_diffed(
     self,
     window_size: int,
@@ -234,18 +240,18 @@ class SlidingWindow(torch.nn.Module):
       raise AssertionError("diff_dt must be positive")
 
     T_req = min(window_size, self.max_window_size)
-    # Build chronological tail and apply per-env replicate padding on-demand
-    seq = self._get_hist_data(T_req, replicate_pad=True)  # (T, N, C)
+    # Build chronological tail and apply per-env replicate padding on-demand; keep time-major for GEMV
+    seq_tnc = self._get_hist_data(T_req, replicate_pad=True, layout="TNC")  # (T, N, C)
 
     # SG kernel for T_req with adaptive degree.
     deg = max(diff_order, min(poly_degree, T_req - 1))
-    w = sg_endpoint_kernel(T_req, deg, diff_order, diff_dt, device=seq.device, dtype=seq.dtype)  # (T,)
+    w = sg_endpoint_kernel(T_req, deg, diff_order, diff_dt, device=seq_tnc.device, dtype=seq_tnc.dtype)  # (T,)
 
     # Fused GEMV: (T, N*C) @ (T,) -> (N*C,)
-    T, N, C = seq.shape
+    T, N, C = seq_tnc.shape
     if T == 0:
       return self._buffer.new_zeros((N, C))
-    seq2d = seq.reshape(T, N * C)  # contiguous view
+    seq2d = seq_tnc.reshape(T, N * C)  # contiguous view
     out_flat = torch.mv(seq2d.t(), w)  # (N*C,)
     return out_flat.view(N, C)
 
@@ -256,7 +262,8 @@ class SlidingWindow(torch.nn.Module):
       if diff_dt is None:
         raise AssertionError("diff_dt must be provided if diff_order is provided")
       return self._get_hist_data_smooth_and_diffed(T, diff_order, float(diff_dt), poly_degree)
-    return self._get_hist_data(T, replicate_pad=False)
+    # Default to user-friendly (N, C, W)
+    return self._get_hist_data(T, replicate_pad=False, layout="NCW")
 
   @property
   def length(self) -> int:

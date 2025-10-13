@@ -12,7 +12,8 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_env import ManagerBasedEnv
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
-
+  from mjlab.utils.sliding_window import SlidingWindow
+  
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
@@ -69,6 +70,14 @@ def joint_vel_rel(
   jnt_ids = asset_cfg.joint_ids
   return asset.data.joint_vel[:, jnt_ids] - default_joint_vel[:, jnt_ids]
 
+def joint_pos_abs(
+  env: ManagerBasedEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  asset: Entity = env.scene[asset_cfg.name]
+  jnt_ids = asset_cfg.joint_ids
+  return asset.data.joint_pos[:, jnt_ids]
+
 
 ##
 # Actions.
@@ -90,3 +99,14 @@ def generated_commands(env: ManagerBasedRlEnv, command_name: str) -> torch.Tenso
   command = env.command_manager.get_command(command_name)
   assert command is not None
   return command
+
+
+
+##
+# Observations history aggregation.
+##
+
+def aggregate_cat(env: ManagerBasedRlEnv, hist: SlidingWindow, **kwarg) -> torch.Tensor:
+  # (N, C, W) -> (N, [c_1, c_2,..., c_w])
+  obs = hist().flatten(start_dim=1)
+  return obs

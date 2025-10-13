@@ -149,13 +149,9 @@ class ObservationCfg:
       }
     )
          
-
   policy: PolicyCfg = field(default_factory=PolicyCfg)
   critic: PrivilegedCfg = field(default_factory=PrivilegedCfg)
-  # discriminator = DiscriminatorGroupCfg(
-  #   concatenate_terms = True,
-  #   enable_corruption =False,
-  # )
+  discriminator: DiscriminatorGroupCfg = field(default_factory=DiscriminatorGroupCfg)
 
 
 @dataclass
@@ -292,7 +288,7 @@ class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
   viewer: ViewerConfig = field(default_factory=lambda: VIEWER_CONFIG)
   decimation: int = 4  # 50 Hz control frequency.
   episode_length_s: float = 20.0
-  amp_cfg: AmpCfg = field(default_factory=lambda: AMP_CFG)
+  amp_cfg: AmpCfg|None = field(default_factory=lambda: AMP_CFG)
 
   def __post_init__(self):
     if self.scene.terrain is not None:

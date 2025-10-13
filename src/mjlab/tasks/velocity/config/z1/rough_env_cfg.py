@@ -8,6 +8,7 @@ from mjlab.tasks.velocity.velocity_env_cfg import (
   LocomotionVelocityEnvCfg,
 )
 from mjlab.utils.spec_config import ContactSensorCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 
 @dataclass
@@ -40,7 +41,7 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
 
     self.actions.joint_pos.scale = Z1_ACTION_SCALE
 
-    self.rewards.feet_slide.params["sensor_names"] = sensor_names
+    # self.rewards.feet_slide.params["sensor_names"] = sensor_names
     self.rewards.pose.params["std"] = {
       # Lower body.
       r".*hip_pitch.*": 0.3,
@@ -65,6 +66,13 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.commands.twist.viz.z_offset = 0.75
 
     self.curriculum.command_vel = None
+    
+    self.observations.discriminator.qpos.params["asset_cfg"].joint_names=[
+      r".*_hip_.*",
+      r".*knee_.*",
+      r".*ankle_pitch.*",
+    ]
+    
 
 
 @dataclass
