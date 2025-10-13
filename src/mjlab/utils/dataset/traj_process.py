@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
-from src.utils.dataset.traj_class import (
+from mjlab.utils.dataset.traj_class import (
     TrajectoryInfo,
     TrajectoryModel,
     TrajectoryData)

@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from flax import struct
 from typing import List
 
-from src.utils.dataset.traj_class import Trajectory, TrajectoryData, interpolate_trajectories
+from mjlab.utils.dataset.traj_class import Trajectory, TrajectoryData, interpolate_trajectories
 
 
 @struct.dataclass
@@ -255,16 +255,44 @@ class TrajectoryHandler(StatefulObject):
                 new_site_order.append(traj_info.site_names.index(s_name))
 
         traj_info = traj_info.reorder_joints(new_joint_order_names)
-        traj_info = traj_info.reorder_bodies(new_body_order) if traj_info.body_names is not None else traj_info
-        traj_info = traj_info.reorder_sites(new_site_order) if traj_info.site_names is not None else traj_info
+
+        if traj_info.body_names is not None:
+            new_body_order_array = TrajectoryHandler._ensure_integer_index_array(new_body_order)
+            traj_info = traj_info.reorder_bodies(new_body_order_array)
+        else:
+            new_body_order_array = None
+
+        if traj_info.site_names is not None:
+            new_site_order_array = TrajectoryHandler._ensure_integer_index_array(new_site_order)
+            traj_info = traj_info.reorder_sites(new_site_order_array)
+        else:
+            new_site_order_array = None
+
         traj_data = traj_data.reorder_joints(jnp.concatenate(new_joint_order_ids_qpos),
                                              jnp.concatenate(new_joint_order_ids_qvel))
-        traj_data = traj_data.reorder_bodies(jnp.array(new_body_order)) \
-            if traj_info.body_names is not None else traj_data
-        traj_data = traj_data.reorder_sites(jnp.array(new_site_order)) \
-            if traj_info.site_names is not None else traj_data
+        if new_body_order_array is not None:
+            traj_data = traj_data.reorder_bodies(new_body_order_array)
+        if new_site_order_array is not None:
+            traj_data = traj_data.reorder_sites(new_site_order_array)
 
         return traj_data, traj_info
+
+    @staticmethod
+    def _ensure_integer_index_array(new_order):
+        if new_order is None:
+            return None
+
+        if isinstance(new_order, (list, tuple)):
+            return jnp.asarray(new_order, dtype=jnp.int32)
+
+        if isinstance(new_order, np.ndarray):
+            return jnp.asarray(new_order.astype(np.int32))
+
+        # jax arrays or other types exposing astype
+        if hasattr(new_order, "astype"):
+            return new_order.astype(jnp.int32)
+
+        return jnp.asarray(new_order, dtype=jnp.int32)
 
     def init_state(self, env=None, key=None, model=None, data=None, backend=None):
         return TrajState(0, 0, 0)

@@ -84,10 +84,29 @@ class EventTermCfg(ManagerTermBaseCfg):
 
 @dataclass
 class ObservationTermCfg(ManagerTermBaseCfg):
-  """Configuration for an observation term."""
+  """Configuration for an observation term.
+
+  Fields:
+    func: Callable that produces the raw per-step observation tensor (N, ...).
+    params: Keyword arguments passed to `func` (and to `hist_func` if provided).
+    noise: Optional corruption/noise to apply after term computation.
+    clip: Optional min/max clipping applied after noise.
+
+    hist_window_size: Length of the per-term SlidingWindow. 0 disables SlidingWindow and
+      incurs no overhead; the term behaves like before (stateless).
+    hist_func: Optional aggregator callable. If provided, `func` becomes the input source
+      that is pushed into the per-term SlidingWindow and `hist_func` is used to generate
+      the final term output for this step by consuming the SlidingWindow contents.
+      Signature is expected as:
+        hist_func(env, hist_window: SlidingWindow, **params) -> torch.Tensor
+  """
 
   noise: NoiseCfg | NoiseModelCfg | None = None
   clip: tuple[float, float] | None = None
+
+  # SlidingWindow controls
+  hist_window_size: int = 0
+  hist_func: Any | None = None
 
 
 @dataclass
