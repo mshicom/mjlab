@@ -3,8 +3,9 @@ from dataclasses import dataclass
 
 import torch
 
-from mjlab.managers.observation_manager import ObservationManager
 from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationTermCfg
+from mjlab.managers.observation_manager import ObservationManager
+
 
 # ----------------------
 # Mocks and helpers
@@ -32,15 +33,15 @@ def obs_joint_pos(env):
 # Hist func helpers (read params from term_cfg.params)
 def hist_value(env, hist, window: int = 5, dt: float = 0.05, poly_degree: int = 2, **kwargs):
     # Endpoint SG smoothing (value at latest sample)
-    return hist.get_hist_data_smooth_and_diffed(window_size=window, diff_order=0, diff_dt=dt, poly_degree=poly_degree)
+    return hist._get_hist_data_smooth_and_diffed(window_size=window, diff_order=0, diff_dt=dt, poly_degree=poly_degree)
 
 def hist_vel(env, hist, window: int = 9, dt: float = 0.05, poly_degree: int = 2, **kwargs):
     # Endpoint SG 1st derivative
-    return hist.get_hist_data_smooth_and_diffed(window_size=window, diff_order=1, diff_dt=dt, poly_degree=poly_degree)
+    return hist._get_hist_data_smooth_and_diffed(window_size=window, diff_order=1, diff_dt=dt, poly_degree=poly_degree)
 
 def hist_acc(env, hist, window: int = 9, dt: float = 0.05, poly_degree: int = 2, **kwargs):
     # Endpoint SG 2nd derivative
-    return hist.get_hist_data_smooth_and_diffed(window_size=window, diff_order=2, diff_dt=dt, poly_degree=poly_degree)
+    return hist._get_hist_data_smooth_and_diffed(window_size=window, diff_order=2, diff_dt=dt, poly_degree=poly_degree)
 
 @dataclass
 class BaseGroupCfg(ObservationGroupCfg):
@@ -54,45 +55,9 @@ class ObsCfgOne:
 
 
 # ----------------------
-# Tests
+# Tests: baseline manager + window behaviors
 # ----------------------
 
-
-def test_partial_reset_replicate_padding():
-  from mjlab.utils.sliding_window import SlidingWindow
-
-  N, C, W = 4, 3, 5
-  sw = SlidingWindow(num_envs=N, feature_shape=torch.Size([C]), max_window_size=W, device=torch.device("cpu"))
-
-  # Push 3 steps with distinct values per env/channel
-  for t in range(3):
-    x = torch.full((N, C), float(t + 1))  # t=0 -> 1s, t=1 -> 2s, t=2 -> 3s
-    sw.push(x)
-
-  # Partially reset envs 1 and 3 (0-based)
-  sw.reset(env_ids=torch.tensor([1, 3]))
-
-  # Next push (first actual frame after reset)
-  x4 = torch.full((N, C), 10.0)
-  sw.push(x4)
-
-  # Request T=4 history and check replicate padding for reset envs
-  seq = sw.get_hist_data(4)  # (T=4, N, C)
-
-  # For env 1 and 3: valid_len=1 -> pad_len = 4 - 1 = 3, first actual frame is value 10
-  # So first 3 rows should be 10, last row is 10
-  assert torch.allclose(seq[:3, 1, :], torch.full((3, C), 10.0))
-  assert torch.allclose(seq[:3, 3, :], torch.full((3, C), 10.0))
-
-  # For env 0 and 2: valid_len=4 -> pad_len=0, chronological values should reflect pushes [1,2,3,10]
-  assert torch.allclose(seq[:, 0, 0], torch.tensor([1.0, 2.0, 3.0, 10.0]))
-  assert torch.allclose(seq[:, 2, 0], torch.tensor([1.0, 2.0, 3.0, 10.0]))
-
-  # SG deriv1 over T=4 should be finite and not crash
-  v = sw.get_hist_data_smooth_and_diffed(window_size=4, diff_order=1, diff_dt=0.1, poly_degree=2)
-  assert v.shape == (N, C)
-  
-  
 def test_no_window_passthrough_and_get_term_hist_none():
     # hist_window_size = 0 -> no sliding window overhead, passthrough raw obs
     env = _MockEnv(num_envs=2, num_joints=3)
@@ -164,12 +129,12 @@ def test_hist_value_smoothing_and_hist_shapes():
     assert term.shape == (N, J)
     assert torch.allclose(term, torch.full((N, J), latest, device=env.device, dtype=torch.float32), atol=1e-4)
 
-    # get_term_hist returns a SlidingWindow and its get_hist_data returns (T_hist, N, J)
+    # get_term_hist returns a SlidingWindow and its _get_hist_data returns (T_hist, N, J)
     hist = om.get_term_hist("base_pos", group="base")
     assert hist is not None
-    seq = hist.get_hist_data(window_size=5)
+    seq = hist._get_hist_data(window_size=5)  # replicate_pad=False by default
     assert seq.shape == (5, N, J)
-    # Check chronological ordering matches the last 5 values of the ramp
+    # Check chronological ordering matches the last 5 values of the ramp (raw tail)
     expected_tail = torch.stack([torch.full((N, J), b + s * t, device=env.device) for t in range(T - 5, T)], dim=0)
     assert torch.allclose(seq, expected_tail, atol=1e-6)
 
@@ -245,6 +210,7 @@ def test_hist_second_derivative_quadratic_exact():
 
 def test_partial_reset_replicate_padding_in_manager():
     # Verify partial reset in ObservationManager propagates to SlidingWindow
+    # and that replicate_pad=True applies per-env replicate padding on _get_hist_data.
     N, J, W = 4, 3, 5
     env = _MockEnv(num_envs=N, num_joints=J)
     dt = 0.1
@@ -278,7 +244,8 @@ def test_partial_reset_replicate_padding_in_manager():
 
     hist = om.get_term_hist("base_pos", group="base")
     assert hist is not None
-    seq = hist.get_hist_data(window_size=4)  # (T=4, N, C)
+    # Request replicate_pad=True to apply per-env replicate padding at the head
+    seq = hist._get_hist_data(window_size=4, replicate_pad=True)  # (T=4, N, C)
 
     # For reset envs: valid_len=1 -> pad_len = 3, head should be replicated with 10.0
     assert torch.allclose(seq[:3, 1, :], torch.full((3, J), 10.0, device=env.device))
@@ -366,7 +333,6 @@ def test_clip_pipeline_applied_after_hist_func():
     out = om.get_term("base_pos", group="base")
     assert torch.all(out <= 1.0 + 1e-6)
     assert torch.all(out >= 0.0 - 1e-6)
-    
 
 
 # ----------------------

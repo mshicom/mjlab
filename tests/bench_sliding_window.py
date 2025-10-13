@@ -5,14 +5,14 @@ Benchmark SlidingWindow vs alternatives on the hot path.
 Scenarios:
   A) reset-only
   B) push-only
-  C) push + get_hist_data (raw window)
+  C) push + _get_hist_data (raw window)
   D) push + endpoint SG smoothing (diff_order=0..3) via generic aggregator
   E) push + periodic reset (reset every R pushes)
 
 Configs (defaults chosen to stress the memory bandwidth):
   - num_envs=8196
   - obs_dim=50
-  - window_size=12
+  - max_window_size=12
   - iters=4096
   - device=cpu (set --device cuda to run on GPU if available)
 
@@ -57,8 +57,8 @@ def _format_num(n: float) -> str:
 
 class RingBufferTorch:
   """Naive torch-only ring buffer (time-first)."""
-  def __init__(self, num_envs: int, feat_dim: int, window_size: int, device: torch.device):
-    self.W = int(window_size)
+  def __init__(self, num_envs: int, feat_dim: int, max_window_size: int, device: torch.device):
+    self.W = int(max_window_size)
     self.N = int(num_envs)
     self.C = int(feat_dim)
     self.dev = device
@@ -77,13 +77,13 @@ class RingBufferTorch:
     self.idx = (self.idx + 1) % self.W
     self.count = min(self.count + 1, self.W)
 
-  def get_hist_data(self, window_size: int) -> torch.Tensor:
+  def _get_hist_data(self, max_window_size: int) -> torch.Tensor:
     # Returns (T, N, C); chronological; T <= W
-    if window_size < 1:
-      raise AssertionError("window_size must be >= 1")
+    if max_window_size < 1:
+      raise AssertionError("max_window_size must be >= 1")
     if self.count == 0:
       return self.buf.new_zeros((0, self.N, self.C))
-    T = min(window_size, self.count)
+    T = min(max_window_size, self.count)
     if self.count < self.W:
       window = self.buf[: self.count]
     else:
@@ -100,10 +100,10 @@ class RingBufferTorchTL:
   Storage: (N, C, 2W), mirror writes to [i] and [i+W], so last T frames are
   _buf[:, :, i+W-T : i+W] contiguous.
 
-  get_hist_data returns (T, N, C) to match generic aggregator expectations.
+  _get_hist_data returns (T, N, C) to match generic aggregator expectations.
   """
-  def __init__(self, num_envs: int, feat_dim: int, window_size: int, device: torch.device):
-    self.W = int(window_size)
+  def __init__(self, num_envs: int, feat_dim: int, max_window_size: int, device: torch.device):
+    self.W = int(max_window_size)
     self.N = int(num_envs)
     self.C = int(feat_dim)
     self.dev = device
@@ -126,13 +126,13 @@ class RingBufferTorchTL:
     if self.count < W:
       self.count += 1
 
-  def get_hist_data(self, window_size: int) -> torch.Tensor:
+  def _get_hist_data(self, max_window_size: int) -> torch.Tensor:
     # Returns (T, N, C); chronological; T <= W
-    if window_size < 1:
-      raise AssertionError("window_size must be >= 1")
+    if max_window_size < 1:
+      raise AssertionError("max_window_size must be >= 1")
     if self.count == 0:
       return self.buf.new_zeros((0, self.N, self.C))
-    T = min(window_size, self.count, self.W)
+    T = min(max_window_size, self.count, self.W)
     end = self.idx + self.W  # exclusive
     start = end - T
     seq_nct = self.buf[:, :, start:end]  # (N, C, T) contiguous
@@ -141,8 +141,8 @@ class RingBufferTorchTL:
 
 class DequeBuffer:
   """collections.deque-based history buffer. Stores copies of inputs, stacks on read."""
-  def __init__(self, num_envs: int, feat_dim: int, window_size: int, device: torch.device):
-    self.W = int(window_size)
+  def __init__(self, num_envs: int, feat_dim: int, max_window_size: int, device: torch.device):
+    self.W = int(max_window_size)
     self.N = int(num_envs)
     self.C = int(feat_dim)
     self.dev = device
@@ -155,20 +155,20 @@ class DequeBuffer:
     # Store a copy to be consistent with ring buffers (write into internal storage)
     self.deq.append(x.clone())
 
-  def get_hist_data(self, window_size: int) -> torch.Tensor:
-    if window_size < 1:
-      raise AssertionError("window_size must be >= 1")
+  def _get_hist_data(self, max_window_size: int) -> torch.Tensor:
+    if max_window_size < 1:
+      raise AssertionError("max_window_size must be >= 1")
     if not self.deq:
       return torch.zeros(0, self.N, self.C, device=self.dev, dtype=torch.float32)
-    T = min(window_size, len(self.deq))
+    T = min(max_window_size, len(self.deq))
     return torch.stack(list(self.deq)[-T:], dim=0)  # (T, N, C)
 
 
 class TensorDictBuffer:
   """TensorDict-based ring buffer (optional; requires tensordict)."""
-  def __init__(self, num_envs: int, feat_dim: int, window_size: int, device: torch.device):
+  def __init__(self, num_envs: int, feat_dim: int, max_window_size: int, device: torch.device):
     from tensordict import TensorDict  # type: ignore
-    self.W = int(window_size)
+    self.W = int(max_window_size)
     self.N = int(num_envs)
     self.C = int(feat_dim)
     self.dev = device
@@ -187,12 +187,12 @@ class TensorDictBuffer:
     self.idx = (self.idx + 1) % self.W
     self.count = min(self.count + 1, self.W)
 
-  def get_hist_data(self, window_size: int) -> torch.Tensor:
-    if window_size < 1:
-      raise AssertionError("window_size must be >= 1")
+  def _get_hist_data(self, max_window_size: int) -> torch.Tensor:
+    if max_window_size < 1:
+      raise AssertionError("max_window_size must be >= 1")
     if self.count == 0:
       return self.td["buf"].new_zeros((0, self.N, self.C))
-    T = min(window_size, self.count)
+    T = min(max_window_size, self.count)
     if self.count < self.W:
       window = self.td["buf"][: self.count]
     else:
@@ -203,7 +203,7 @@ class TensorDictBuffer:
     return window[-T:]
 
 
-def sg_endpoint_aggregate(hist_TNC: torch.Tensor, window_size: int, diff_order: int, dt: float, poly_degree: int) -> torch.Tensor:
+def sg_endpoint_aggregate(hist_TNC: torch.Tensor, max_window_size: int, diff_order: int, dt: float, poly_degree: int) -> torch.Tensor:
   """Generic endpoint SG aggregator applied to raw history.
   hist_TNC: (T, N, C), chronological.
   Returns: (N, C)
@@ -216,7 +216,7 @@ def sg_endpoint_aggregate(hist_TNC: torch.Tensor, window_size: int, diff_order: 
 
   # replicate-pad on the left if needed
   min_req = max(diff_order + 1, 1)
-  target_T = max(min_req, min(window_size, max(T, 1)))
+  target_T = max(min_req, min(max_window_size, max(T, 1)))
   if T < target_T:
     needed = target_T - T
     if T == 0:
@@ -252,32 +252,32 @@ def run_scenario_push_only(name: str, impl, inputs, iters: int, device: str) -> 
   return iters / (t1 - t0)
 
 
-def run_scenario_push_get_hist(name: str, impl, inputs, iters: int, window_size: int, device: str) -> float:
+def run_scenario_push_get_hist(name: str, impl, inputs, iters: int, max_window_size: int, device: str) -> float:
   _sync(device)
   t0 = time.perf_counter()
   for i in range(iters):
     x = inputs[i % len(inputs)]
     impl.push(x)
-    _ = impl.get_hist_data(window_size)
+    _ = impl._get_hist_data(max_window_size)
   _sync(device)
   t1 = time.perf_counter()
   return iters / (t1 - t0)
 
 
-def run_scenario_push_sg(name: str, impl, inputs, iters: int, window_size: int, diff_order: int, dt: float, poly_degree: int, device: str) -> float:
+def run_scenario_push_sg(name: str, impl, inputs, iters: int, max_window_size: int, diff_order: int, dt: float, poly_degree: int, device: str) -> float:
   _sync(device)
   t0 = time.perf_counter()
   for i in range(iters):
     x = inputs[i % len(inputs)]
     impl.push(x)
-    hist = impl.get_hist_data(window_size)  # expected shape (T, N, C)
-    _ = sg_endpoint_aggregate(hist, window_size=window_size, diff_order=diff_order, dt=dt, poly_degree=poly_degree)
+    hist = impl._get_hist_data(max_window_size)  # expected shape (T, N, C)
+    _ = sg_endpoint_aggregate(hist, max_window_size=max_window_size, diff_order=diff_order, dt=dt, poly_degree=poly_degree)
   _sync(device)
   t1 = time.perf_counter()
   return iters / (t1 - t0)
 
 
-def run_scenario_push_periodic_reset(name: str, impl, inputs, iters: int, window_size: int, reset_every: int, device: str) -> float:
+def run_scenario_push_periodic_reset(name: str, impl, inputs, iters: int, max_window_size: int, reset_every: int, device: str) -> float:
   """Push with a periodic reset every `reset_every` steps. Returns ops/sec of loop iterations."""
   assert reset_every >= 1
   _sync(device)
@@ -287,23 +287,23 @@ def run_scenario_push_periodic_reset(name: str, impl, inputs, iters: int, window
       impl.reset()
     x = inputs[i % len(inputs)]
     impl.push(x)
-    _ = impl.get_hist_data(window_size)
+    _ = impl._get_hist_data(max_window_size)
   _sync(device)
   t1 = time.perf_counter()
   return iters / (t1 - t0)
 
 
-def maybe_build_tensordict_buffer(num_envs: int, obs_dim: int, window_size: int, device: torch.device):
+def maybe_build_tensordict_buffer(num_envs: int, obs_dim: int, max_window_size: int, device: torch.device):
   try:
     import tensordict  # noqa: F401
   except Exception:
     return None
-  return TensorDictBuffer(num_envs, obs_dim, window_size, device)
+  return TensorDictBuffer(num_envs, obs_dim, max_window_size, device)
 
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+  parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
   parser.add_argument("--num-envs", type=int, default=8196)
   parser.add_argument("--obs-dim", type=int, default=50)
   parser.add_argument("--window", type=int, default=12)
@@ -340,24 +340,24 @@ def main():
 
   # Build implementations
   impls: list[tuple[str, object]] = []
-  impls.append(("SlidingWindow", SlidingWindow(num_envs=N, feature_shape=torch.Size([C]), window_size=W, device=dev)))
-  impls.append(("RingBufferTorch", RingBufferTorch(num_envs=N, feat_dim=C, window_size=W, device=dev)))
-  impls.append(("RingBufferTorchTL", RingBufferTorchTL(num_envs=N, feat_dim=C, window_size=W, device=dev)))
+  impls.append(("SlidingWindow", SlidingWindow(num_envs=N, feature_shape=torch.Size([C]), max_window_size=W, device=dev)))
+  impls.append(("RingBufferTorch", RingBufferTorch(num_envs=N, feat_dim=C, max_window_size=W, device=dev)))
+  impls.append(("RingBufferTorchTL", RingBufferTorchTL(num_envs=N, feat_dim=C, max_window_size=W, device=dev)))
   td_impl = maybe_build_tensordict_buffer(N, C, W, dev)
   if td_impl is not None:
     impls.append(("TensorDictBuffer", td_impl))
-  impls.append(("DequeBuffer", DequeBuffer(num_envs=N, feat_dim=C, window_size=W, device=dev)))
+  impls.append(("DequeBuffer", DequeBuffer(num_envs=N, feat_dim=C, max_window_size=W, device=dev)))
 
   # Warm-up
   for name, impl in impls:
     # fill buffers and call reset a few times
     for i in range(max(args.warmup, W * 2)):
       impl.push(inputs[i % len(inputs)])
-    _ = impl.get_hist_data(W)
+    _ = impl._get_hist_data(W)
     impl.reset()
     for i in range(W):
       impl.push(inputs[i % len(inputs)])
-    _ = impl.get_hist_data(W)
+    _ = impl._get_hist_data(W)
     if device_str == "cuda":
       torch.cuda.synchronize()
 

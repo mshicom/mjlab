@@ -47,21 +47,23 @@ def sg_endpoint_kernel(
 
 
 class SlidingWindow(torch.nn.Module):
-  """Time-first sliding window optimized for throughput (single-width ring buffer) with partial reset.
+  """Time-first ring buffer optimized for throughput with partial resets.
 
-  Storage layout:
-    - _buffer: (W, N, C_flat) where W=window_size
+  Storage:
+    - _buffer: (W, N, C_flat) with W = max_window_size
 
   API:
-    - push(x): x is (N, C_flat), contiguous preferred.
-    - reset(env_ids: Optional[Tensor|slice]): partial or global reset.
-    - get_hist_data(T): (T, N, C_flat) chronological tail with per-env replicate padding (and global zero-left-pad after global reset).
-    - get_hist_data_smooth_and_diffed(T, diff_order, diff_dt, poly_degree): (N, C_flat)
-      Applies per-env replicate padding and then SG endpoint.
+    - push(x): x is (N, C_flat)
+    - reset(env_ids: Optional[Tensor|slice]): partial or global reset
+    - _get_hist_data(window_size: int, replicate_pad: bool = False) -> (T, N, C_flat)
+      - replicate_pad=False (default): fast slice with optional zero-left-pad after global reset
+      - replicate_pad=True: additionally apply per-env replicate padding based on last partial reset
+    - _get_hist_data_smooth_and_diffed(window_size, diff_order, diff_dt, poly_degree=2)
+      Returns (N, C_flat); applies per-env replicate padding internally.
 
   Notes:
-    - _valid_len (N,) tracks per-env valid history length (0..W). Updated on push and reset.
-    - Endpoint SG supports variable window, adaptive polynomial degree, and per-env replicate padding.
+    - No per-env ops on push; per-env padding is computed lazily on read when requested.
+    - Partial reset tracked by per-env last_reset_step; valid_len is derived as (step - last_reset_step).
   """
 
   def __init__(
@@ -76,95 +78,75 @@ class SlidingWindow(torch.nn.Module):
     self.max_window_size: int = int(max_window_size)
     self.num_envs: int = int(num_envs)
 
+    # Flatten feature shape to a single C_flat for storage/perf
     nf = 1
     for d in feature_shape:
       nf *= int(d)
     self.num_features: int = nf
 
     dev = device if device is not None else torch.device("cpu")
-    # Time-first ring buffer: (W, N, C)
-    self.register_buffer("_buffer", torch.zeros(self.max_window_size, self.num_envs, self.num_features, device=dev))
-    # Per-env valid length since last (partial) reset: 0..W
-    self.register_buffer("_valid_len", torch.zeros(self.num_envs, dtype=torch.int32, device=dev))
-    # Global counters (Python ints to avoid device sync)
-    self._count: int = 0           # max valid length across all envs (for global zero-pad in get_hist_data)
-    self._write_idx: int = 0       # modulo W
 
+    # Time-first buffer (W, N, C)
+    self.register_buffer("_buffer", torch.zeros(self.max_window_size, self.num_envs, self.num_features, device=dev))
+    # Per-env last reset "step" counter; used to compute valid_len lazily
+    self.register_buffer("_last_reset_step", torch.zeros(self.num_envs, dtype=torch.int64, device=dev))
+
+    # Global counters (Python ints to avoid device syncs)
+    self._count: int = 0           # global number of valid frames since last global reset, capped at W
+    self._write_idx: int = 0       # ring index [0..W-1]
+    self._step: int = 0            # monotonically increasing "time step" since last global reset
+
+  # ----------------
+  # State management
+  # ----------------
+
+  @torch.no_grad()
   def reset(self, env_ids: Optional[torch.Tensor | slice] = None) -> None:
-    """Reset history. If env_ids is None, global reset; otherwise, partial reset for selected envs."""
+    """Reset history. If env_ids is None, global reset; else, per-env partial reset."""
     if env_ids is None:
-      # Cheap global reset: do not zero buffer; pad zeros/replicate will handle reads.
-      self._valid_len.zero_()
+      # Global reset: do not zero buffer; leave it as scratch. Reads will zero/replicate-pad as needed.
+      self._last_reset_step.zero_()
       self._count = 0
       self._write_idx = 0
+      self._step = 0
     else:
-      # Partial reset: only reset valid length for given envs.
-      self._valid_len[env_ids] = 0
-      # Keep global counters; writes continue happily.
+      # Partial reset: mark selected envs as newly reset at current step.
+      self._last_reset_step[env_ids] = int(self._step)
 
+  # ----
+  # Push
+  # ----
+
+  @torch.no_grad()
   def push(self, x: Tensor) -> None:
     """Push newest observation x: (N, C_flat)."""
+    # Minimal runtime checks for hot path
     if x.dim() != 2 or x.shape[0] != self.num_envs or x.shape[1] != self.num_features:
       raise AssertionError(f"Expected x of shape (N={self.num_envs}, C_flat={self.num_features}), got {tuple(x.shape)}")
+
     i = self._write_idx
     self._buffer[i].copy_(x)  # contiguous row write
+
     self._write_idx = (i + 1) % self.max_window_size
     if self._count < self.max_window_size:
       self._count += 1
-    # Increment per-env valid length, clamp to W.
-    self._valid_len.add_(1)
-    torch.clamp_(self._valid_len, max=self.max_window_size)
+    self._step += 1  # advance logical time
 
-  def _apply_per_env_replicate_pad(self, seq_TNC: Tensor, valid_len: torch.Tensor) -> Tensor:
-    """Apply per-env replicate padding in-place-like: for each env n, replicate seq[first_idx[n]] into the first pad_len[n] rows.
+  # ------------
+  # Read helpers
+  # ------------
 
-    Args:
-      seq_TNC: (T, N, C)
-      valid_len: (N,) ints in [0..W]
-
-    Returns:
-      (T, N, C) with per-env replicate padding applied.
+  @torch.no_grad()
+  def _slice_tail(self, T_req: int) -> Tensor:
+    """Return chronological tail as (T_req, N, C), zero-left-padded after global reset as needed.
+    No per-env replicate padding here.
     """
-    T = seq_TNC.shape[0]
-    if T == 0:
-      return seq_TNC
-    # pad_len[n] = max(0, T - valid_len[n])  (number of frames to replicate at the head)
-    pad_len = (T - valid_len.to(torch.int64)).clamp_min(0).clamp_max(T)  # (N,)
-    if torch.any(pad_len > 0):
-      N = seq_TNC.shape[1]
-      dev = seq_TNC.device
-      # First actual index per env within the returned window
-      first_idx = torch.minimum(pad_len, torch.tensor(T - 1, device=dev, dtype=pad_len.dtype))  # (N,)
-      env_idx = torch.arange(N, device=dev)
-      first = seq_TNC[first_idx, env_idx, :]  # (N, C)
-      # If valid_len==0 (no actual frames), use zeros for first
-      first = torch.where(valid_len.view(N, 1) > 0, first, torch.zeros_like(first))
-      # Build mask (T, N, 1): True where t < pad_len[n]
-      t_idx = torch.arange(T, device=dev).view(T, 1)
-      mask = (t_idx < pad_len.view(1, N)).unsqueeze(-1)  # (T, N, 1)
-      # Apply replicate padding
-      seq_TNC = torch.where(mask, first.unsqueeze(0), seq_TNC)
-    return seq_TNC
-
-  def get_hist_data(self, window_size: int) -> Tensor:
-    """Return raw chronological tail as (T, N, C_flat), with per-env replicate padding applied.
-
-    Behavior:
-      - Builds chronological tail from the ring buffer (time-first).
-      - If the global buffer contains fewer than T frames (immediately after a global reset),
-        zero-left-pad the sequence.
-      - Then, for each environment, replicate-pad the head up to its per-env pad length
-        based on valid_len (handles partial resets).
-    """
-    if window_size < 1:
-      raise AssertionError("window_size must be >= 1")
     if self._count == 0:
       return self._buffer.new_zeros((0, self.num_envs, self.num_features))
 
-    T_req = min(window_size, self.max_window_size)
     T_avail = min(self._count, T_req)
-
     i = self._write_idx
+
     if T_avail <= i:
       seq = self._buffer[i - T_avail : i]  # (T_avail, N, C)
     else:
@@ -178,18 +160,72 @@ class SlidingWindow(torch.nn.Module):
       zeros = self._buffer.new_zeros((pad_len, self.num_envs, self.num_features))
       seq = torch.cat((zeros, seq), dim=0)  # left-pad to requested T
 
-    # Per-env replicate padding (handles partial resets)
-    seq = self._apply_per_env_replicate_pad(seq, self._valid_len)
     return seq  # (T_req, N, C)
 
-  def get_hist_data_smooth_and_diffed(
+  @torch.no_grad()
+  def _apply_per_env_replicate_pad(self, seq_TNC: Tensor, T_req: int) -> Tensor:
+    """Apply per-env replicate padding to seq_TNC (T_req, N, C) using last_reset_step and self._step."""
+    if T_req == 0:
+      return seq_TNC
+
+    # valid_len[n] = clamp(step - last_reset[n], 0, T_req)
+    # number of head frames to replicate per env: pad_len[n] = T_req - valid_len[n]
+    # Note: We do not cap by global _count here; _slice_tail already zero-left-padded globally.
+    step = torch.tensor(self._step, device=seq_TNC.device, dtype=torch.int64)
+    valid_len = (step - self._last_reset_step).clamp_min(0).clamp_max(T_req)  # (N,)
+    pad_len = (T_req - valid_len).clamp_min(0)  # (N,)
+
+    if not torch.any(pad_len > 0):
+      return seq_TNC  # nothing to replicate
+
+    N = seq_TNC.shape[1]
+    dev = seq_TNC.device
+    # Index of first actual frame per env inside the returned window
+    first_idx = torch.minimum(pad_len, torch.tensor(T_req - 1, device=dev, dtype=pad_len.dtype))  # (N,)
+    env_idx = torch.arange(N, device=dev)
+    first = seq_TNC[first_idx, env_idx, :]  # (N, C)
+    # Envs with valid_len==0 -> no actual frames; use zeros for "first"
+    first = torch.where(valid_len.view(N, 1) > 0, first, torch.zeros_like(first))
+
+    # Mask: (T, N, 1) True for head positions t < pad_len[n]
+    t_idx = torch.arange(T_req, device=dev).view(T_req, 1)
+    mask = (t_idx < pad_len.view(1, N)).unsqueeze(-1)
+
+    return torch.where(mask, first.unsqueeze(0), seq_TNC)
+
+  # ---------------
+  # Public read API
+  # ---------------
+
+  @torch.no_grad()
+  def _get_hist_data(self, window_size: int, replicate_pad: bool = False) -> Tensor:
+    """Return chronological tail as (T, N, C_flat).
+
+    Args:
+      window_size: desired history length T (<= max_window_size).
+      replicate_pad: if True, apply per-env replicate padding at the head based on partial resets.
+                     Defaults to False for max throughput.
+    """
+    if window_size < 1:
+      raise AssertionError("window_size must be >= 1")
+    T_req = min(window_size, self.max_window_size)
+    seq = self._slice_tail(T_req)
+    if replicate_pad and T_req > 0:
+      seq = self._apply_per_env_replicate_pad(seq, T_req)
+    return seq
+
+  @torch.no_grad()
+  def _get_hist_data_smooth_and_diffed(
     self,
     window_size: int,
     diff_order: int,
     diff_dt: float,
     poly_degree: int = 2,
   ) -> Tensor:
-    """Endpoint SG smoothing/differentiation at the latest sample. Returns (N, C_flat)."""
+    """Endpoint SG smoothing/differentiation at the latest sample. Returns (N, C_flat).
+
+    Per-env replicate padding is applied prior to SG to correctly handle partial resets.
+    """
     if window_size < 1:
       raise AssertionError("window_size must be >= 1")
     if not (0 <= diff_order <= 3):
@@ -198,8 +234,8 @@ class SlidingWindow(torch.nn.Module):
       raise AssertionError("diff_dt must be positive")
 
     T_req = min(window_size, self.max_window_size)
-    # Build chronological tail with global zero-pad and per-env replicate padding
-    seq = self.get_hist_data(T_req)  # (T, N, C) with per-env replicate pad applied
+    # Build chronological tail and apply per-env replicate padding on-demand
+    seq = self._get_hist_data(T_req, replicate_pad=True)  # (T, N, C)
 
     # SG kernel for T_req with adaptive degree.
     deg = max(diff_order, min(poly_degree, T_req - 1))
@@ -207,106 +243,22 @@ class SlidingWindow(torch.nn.Module):
 
     # Fused GEMV: (T, N*C) @ (T,) -> (N*C,)
     T, N, C = seq.shape
+    if T == 0:
+      return self._buffer.new_zeros((N, C))
     seq2d = seq.reshape(T, N * C)  # contiguous view
     out_flat = torch.mv(seq2d.t(), w)  # (N*C,)
-    out = out_flat.view(N, C)
-    return out  # (N, C_flat)
+    return out_flat.view(N, C)
+
+  # Optional callable alias to support previous underscore API usage
+  def __call__(self, length: Optional[int] = None, diff_order: Optional[int] = None, diff_dt: Optional[float] = None, poly_degree: int = 2, *args, **kwargs):
+    T = length or self.max_window_size
+    if diff_order is not None:
+      if diff_dt is None:
+        raise AssertionError("diff_dt must be provided if diff_order is provided")
+      return self._get_hist_data_smooth_and_diffed(T, diff_order, float(diff_dt), poly_degree)
+    return self._get_hist_data(T, replicate_pad=False)
 
   @property
   def length(self) -> int:
-    """Current global valid history length (<= window_size)."""
+    """Current global valid history length (<= max_window_size)."""
     return self._count
-  
-
-def main() -> None:
-  """Visualize smoothing and differentiation using endpoint SG kernels with replicate padding.
-
-  Requires matplotlib to be installed. Produces a few plots comparing:
-    - Raw signal vs SG-smoothed (different window sizes/degrees).
-    - 1st and 2nd derivatives estimated via SG at the endpoint.
-  """
-  import matplotlib.pyplot as plt
-  
-  T = 400
-  noise_std=0.1
-  dt = 0.05
-  theta1 = 2.0 * math.pi * 1  #  Hz
-  theta2 = 2.0 * math.pi * 0.5 # 0.5 Hz
-  t = torch.arange(T, dtype=torch.float32) * dt
-  y = torch.sin(theta1 * t) + 0.5 * torch.sin(theta2 * t)
-  dy = theta1 * torch.cos(theta1 * t) + 0.5 * theta2 * torch.cos(theta2 * t)
-  ddy = - (theta1)**2 * torch.sin(theta1 * t) - 0.5 * (theta2)**2 * torch.sin(theta2 * t)
-  sig = y + noise_std * torch.randn_like(y)
-  
-  # Prepare sliding window and outputs
-  sw = SlidingWindow(num_envs=1, feature_shape=torch.Size([1]), window_size=25, device=torch.device("cpu"))
-
-  sm_outputs = {
-    "win5_deg2": [],
-    "win9_deg2": [],
-    "win15_deg3": [],
-  }
-  d1_outputs = {
-    "win9_deg2": [],
-    "win15_deg3": [],
-  }
-  d2_outputs = {
-    "win15_deg3": [],
-  }
-
-  for i in range(T):
-    x = sig[i].view(1, 1)  # (N=1, C=1)
-    sw.push(x)
-
-    sm_outputs["win5_deg2"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=5, diff_order=0, diff_dt=dt, poly_degree=2)[0, 0].item()
-    )
-    sm_outputs["win9_deg2"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=9, diff_order=0, diff_dt=dt, poly_degree=2)[0, 0].item()
-    )
-    sm_outputs["win15_deg3"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=15, diff_order=0, diff_dt=dt, poly_degree=3)[0, 0].item()
-    )
-
-    d1_outputs["win9_deg2"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=9, diff_order=1, diff_dt=dt, poly_degree=2)[0, 0].item()
-    )
-    d1_outputs["win15_deg3"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=15, diff_order=1, diff_dt=dt, poly_degree=3)[0, 0].item()
-    )
-
-    d2_outputs["win15_deg3"].append(
-      sw.get_hist_data_smooth_and_diffed(window_size=15, diff_order=2, diff_dt=dt, poly_degree=3)[0, 0].item()
-    )
-
-  t = torch.arange(T, dtype=torch.float32) * dt
-  fig, axs = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-  axs[0].plot(t.numpy(), y.numpy(), label="true", color="red", alpha=0.5)
-  axs[0].plot(t.numpy(), sig.numpy(), '-.', label="raw",color="gray", alpha=0.5)
-  axs[0].plot(t.numpy(), sm_outputs["win5_deg2"], label="SG smooth (win=5, deg=2)")
-  axs[0].plot(t.numpy(), sm_outputs["win9_deg2"], label="SG smooth (win=9, deg=2)")
-  axs[0].plot(t.numpy(), sm_outputs["win15_deg3"], label="SG smooth (win=15, deg=3)")
-  axs[0].set_title("Endpoint SG smoothing (latest sample)")
-  axs[0].legend()
-  axs[0].grid(True, alpha=0.2)
-
-  axs[1].plot(t.numpy(), dy.numpy(), label="dy true", color="red", alpha=0.5)
-  axs[1].plot(t.numpy(), d1_outputs["win9_deg2"], label="SG deriv1 (win=9, deg=2)")
-  axs[1].plot(t.numpy(), d1_outputs["win15_deg3"], label="SG deriv1 (win=15, deg=3)")
-  axs[1].set_title("Endpoint SG 1st derivative (latest sample)")
-  axs[1].legend()
-  axs[1].grid(True, alpha=0.2)
-
-  axs[2].plot(t.numpy(), ddy.numpy(), label="ddy true", color="red", alpha=0.5)
-  axs[2].plot(t.numpy(), d2_outputs["win15_deg3"], label="SG deriv2 (win=15, deg=3)")
-  axs[2].set_title("Endpoint SG 2nd derivative (latest sample)")
-  axs[2].legend()
-  axs[2].grid(True, alpha=0.2)
-
-  axs[2].set_xlabel("time (s)")
-  plt.tight_layout()
-  plt.show()
-
-
-if __name__ == "__main__":
-  main()
