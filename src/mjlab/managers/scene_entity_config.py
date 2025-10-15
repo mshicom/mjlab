@@ -53,7 +53,7 @@ class SceneEntityCfg:
       elif self.joint_names is not None:
         if isinstance(self.joint_names, str):
           self.joint_names = [self.joint_names]
-        self.joint_ids, _ = entity.find_joints(
+        self.joint_ids, self.joint_names = entity.find_joints(
           self.joint_names, preserve_order=self.preserve_order
         )
         if (
@@ -125,7 +125,7 @@ class SceneEntityCfg:
       elif self.geom_names is not None:
         if isinstance(self.geom_names, str):
           self.geom_names = [self.geom_names]
-        self.geom_ids, _ = entity.find_geoms(
+        self.geom_ids, self.geom_names = entity.find_geoms(
           self.geom_names, preserve_order=self.preserve_order
         )
         if (
@@ -161,7 +161,7 @@ class SceneEntityCfg:
       elif self.site_names is not None:
         if isinstance(self.site_names, str):
           self.site_names = [self.site_names]
-        self.site_ids, _ = entity.find_sites(
+        self.site_ids, self.site_names = entity.find_sites(
           self.site_names, preserve_order=self.preserve_order
         )
         if (
