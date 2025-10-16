@@ -71,7 +71,7 @@ def joint_pos_limits(
 
 
 class posture:
-  """Penalize the deviation of the joint positions from the default positions.
+  """Reward tracking of the default positions.
 
   Note: This is implemented as a class so that we can resolve the standard deviation
   dictionary into a tensor and thereafter use it in the __call__ method.

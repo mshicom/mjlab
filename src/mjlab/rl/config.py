@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field, MISSING
 from typing import ClassVar, Literal, Tuple
-from mjlab.amp.config import AmpCfg
+from rsl_rl.modules.amp import AMPConfig
 
 @dataclass
 class RslRlSymmetryCfg:
@@ -66,7 +66,7 @@ class RslRlRndCfg:
   """The hidden dimensions for the RND target network. Default is [-1]."""
 
 
-RslRlPpoAmpCfg = AmpCfg  # alias for clarity
+RslRlPpoAmpCfg = AMPConfig  # alias for clarity
   
   
 @dataclass

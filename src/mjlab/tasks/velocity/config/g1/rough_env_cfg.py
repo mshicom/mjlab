@@ -65,15 +65,16 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
 
     self.curriculum.command_vel = None
 
-    # AMP observation term with a minimal feature set
-    # self.amp_cfg.dataset.files = [
-    #   "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz"
-    # ]
-    self.observations.discriminator.qpos.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=[
-      ".*_hip_.*",
-      ".*knee_.*",
-      ".*ankle_pitch.*",
-    ]), 
+    # AMP observation term
+    self.amp_dataset.enabled = False
+    self.amp_dataset.trajectories = [
+      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz"
+    ]
+    # self.observations.discriminator.qpos.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=[
+    #   ".*_hip_.*",
+    #   ".*knee_.*",
+    #   ".*ankle_pitch.*",
+    # ]), 
     
 
 

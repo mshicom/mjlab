@@ -24,9 +24,11 @@ from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm, EventTermCfg as EventTerm
-from mjlab.amp.config import AmpCfg, AmpDatasetCfg, SymmetryAugmentCfg
+from mjlab.utils.dataset.motion_dataset import TrajectorySpec, AmpDatasetCfg
+from typing import List, Optional
 
+from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm, EventTermCfg as EventTerm
+from mjlab.rl.config import RslRlPpoAmpCfg
 SCENE_CFG = SceneCfg(
   terrain=TerrainImporterCfg(
     terrain_type="generator",
@@ -76,21 +78,6 @@ class CommandsCfg:
     ),
   )
 
-if 0:
-  AMP_CFG = AmpCfg(
-    reward_coef=0.5,
-    discr_hidden_dims=(1024, 512, 256),
-    task_reward_lerp=0.0,
-    observation_group="discriminator",  # feed this observation group to the discriminator
-    dataset=AmpDatasetCfg(
-      files=[], # Override in robot cfg.
-      time_between_frames=0.05,
-      preload_transitions=200_000,
-      symmetry=SymmetryAugmentCfg(enabled=False),
-    ),
-  )
-else:
-  AMP_CFG = None
   
 @dataclass
 class ObservationCfg:
@@ -126,6 +113,21 @@ class ObservationCfg:
       ObsTerm, func=mdp.generated_commands, params={"command_name": "twist"}
     )
 
+    # joint state history (qvel, qpos_error)
+    joint_state_history: ObsTerm = term(
+      ObsTerm,
+      func=mdp.joint_state,
+      hist_window_size=2,
+      hist_func=mdp.aggregate_cat,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=[
+          r".*hip.*",
+          r".*knee.*",
+          r".*ankle.*",
+        ]),   # can be overrided in robot cfg.
+      }
+    )
+    
     def __post_init__(self):
       self.enable_corruption = True
 
@@ -137,21 +139,30 @@ class ObservationCfg:
       
 
   @dataclass
-  class DiscriminatorGroupCfg(ObsGroup):
-    # qpos history of selected joints.
-    qpos: ObsTerm = term(
+  class AmpStateCfg(ObsGroup):
+    joint_abs_hist: ObsTerm = term(
       ObsTerm,
       func=mdp.joint_pos_abs,
       hist_window_size=2,
       hist_func=mdp.aggregate_cat,
       params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),   # override in robot cfg.
+        "asset_cfg": SceneEntityCfg("robot", joint_names=[
+          r".*hip.*",
+          r".*knee.*",
+          r".*ankle.*",
+        ]),   # can be overrided in robot cfg.
       }
+      # No noise/corruption to keep clean demos
     )
-         
+
+    def __post_init__(self):
+      self.enable_corruption = False
+      self.concatenate_terms = True
+      self.concatenate_dim = -1
+
   policy: PolicyCfg = field(default_factory=PolicyCfg)
   critic: PrivilegedCfg = field(default_factory=PrivilegedCfg)
-  discriminator: DiscriminatorGroupCfg = field(default_factory=DiscriminatorGroupCfg)
+  amp_state: AmpStateCfg = field(default_factory=AmpStateCfg)
 
 
 @dataclass
@@ -198,6 +209,12 @@ class EventCfg:
 
 @dataclass
 class RewardCfg:
+  is_alive: RewardTerm = term(
+    RewardTerm, 
+    func=mdp.is_alive, 
+    weight=1.0
+  )
+  
   track_lin_vel_exp: RewardTerm = term(
     RewardTerm,
     func=mdp.track_lin_vel_exp,
@@ -225,7 +242,7 @@ class RewardCfg:
   air_time: RewardTerm = term(
     RewardTerm,
     func=mdp.feet_air_time,
-    weight=0.0,
+    weight=0.01,
     params={
       "asset_name": "robot",
       "threshold_min": 0.05,
@@ -236,6 +253,17 @@ class RewardCfg:
       "reward_mode": "on_landing",
     },
   )
+  
+  feet_slide: RewardTerm = term(
+    RewardTerm,
+    func=mdp.feet_slide,
+    weight=-0.25,
+    params={
+        "asset_cfg": SceneEntityCfg("robot", geom_names=[]),  # Override in robot cfg.
+        "sensor_names": [],  # Override in robot cfg.
+    },
+  )
+  
 
 
 @dataclass
@@ -243,6 +271,9 @@ class TerminationCfg:
   time_out: DoneTerm = term(DoneTerm, func=mdp.time_out, time_out=True)
   fell_over: DoneTerm = term(
     DoneTerm, func=mdp.bad_orientation, params={"limit_angle": math.radians(70.0)}
+  )
+  root_height_below_minimum: DoneTerm = term(
+    DoneTerm, func=mdp.root_height_below_minimum, params={"minimum_height": 0.8}
   )
 
 
@@ -273,6 +304,7 @@ SIM_CFG = SimulationCfg(
   ),
 )
 
+AMP_CFG = AmpDatasetCfg()
 
 @dataclass
 class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
@@ -288,7 +320,7 @@ class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
   viewer: ViewerConfig = field(default_factory=lambda: VIEWER_CONFIG)
   decimation: int = 4  # 50 Hz control frequency.
   episode_length_s: float = 20.0
-  amp_cfg: AmpCfg|None = field(default_factory=lambda: AMP_CFG)
+  amp_dataset: AmpDatasetCfg = field(default_factory=lambda: AMP_CFG)
 
   def __post_init__(self):
     if self.scene.terrain is not None:

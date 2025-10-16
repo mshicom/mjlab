@@ -78,6 +78,16 @@ def joint_pos_abs(
   jnt_ids = asset_cfg.joint_ids
   return asset.data.joint_pos[:, jnt_ids]
 
+def joint_state(
+  env: ManagerBasedEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  asset: Entity = env.scene[asset_cfg.name]
+  jnt_ids = asset_cfg.joint_ids
+  qvel = asset.data.joint_vel[:, jnt_ids]
+  qpos = asset.data.joint_pos[:, jnt_ids]
+  qpos_error = qpos - env.action_manager.action[:, jnt_ids]
+  return torch.cat([qvel, qpos_error], dim=-1)
 
 ##
 # Actions.

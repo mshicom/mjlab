@@ -4,6 +4,7 @@ from mjlab.rl import (
   RslRlOnPolicyRunnerCfg,
   RslRlPpoActorCriticCfg,
   RslRlPpoAlgorithmCfg,
+  RslRlPpoAmpCfg
 )
 
 
@@ -33,6 +34,24 @@ class UnitreeG1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
       lam=0.95,
       desired_kl=0.01,
       max_grad_norm=1.0,
+      amp_cfg=RslRlPpoAmpCfg(
+        enabled=False,
+        obs_key="amp_state",
+        hidden_dims=[256, 256],
+        activation="elu",
+        init_output_scale=0.0,
+        learning_rate=1.0e-4,
+        weight_decay=0.0,
+        logit_reg=0.0,
+        grad_penalty=0.0,
+        disc_weight_decay=0.0,
+        reward_scale=1.0,
+        reward_coef=1.0,
+        eval_batch_size=0,
+        norm_until=None,
+        # demo_provider=resolved automatically from env.sample_amp_demos if present
+        demo_batch_ratio=1.0
+      )
     )
   )
   experiment_name: str = "g1_velocity"

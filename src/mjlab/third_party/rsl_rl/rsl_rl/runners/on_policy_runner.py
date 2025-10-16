@@ -13,10 +13,10 @@ import warnings
 from collections import deque
 
 import rsl_rl
-# Use the updated PPO with AMP/RND/Symmetry integration
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
+# NEW: AMP resolver
 from rsl_rl.modules.amp import resolve_amp_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
@@ -43,7 +43,11 @@ class OnPolicyRunner:
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        # AMP: ensure obs_groups exists before resolvers
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
+
+        # NEW: resolve AMP configuration (validate obs key, set demo_provider if env provides it)
+        self.alg_cfg = resolve_amp_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
         # create the algorithm
         self.alg = self._construct_algorithm(obs)
@@ -104,20 +108,11 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs_next, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs_next, rewards, dones = (obs_next.to(self.device), rewards.to(self.device), dones.to(self.device))
-
-                    # AMP: env observation term writes extras["amp_observations"]; AMP module pairs (prev, curr)
-                    if hasattr(self.alg, "amp") and self.alg.amp is not None:
-                        self.alg.amp.update_from_env_extras(extras, dones)
-
-                    # process the step with PPO (normalizers, intrinsic reward, time-out bootstrap, storage)
-                    self.alg.process_env_step(obs_next, rewards, dones, extras)
-
-                    # prepare next observation
-                    obs = obs_next
-
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # process the step
+                    self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     # book keeping
@@ -309,15 +304,10 @@ class OnPolicyRunner:
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-
-        # AMP (if used)
-        if hasattr(self.alg, "amp") and self.alg.amp is not None:
-            # include_replay=False by default; turn on if you really want to persist it
-            saved_dict["amp_state_dict"] = self.alg.amp.state_dict(include_replay=False)
-            # If your algorithm has a separate optimizer for AMP, save it too (optional):
-            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer is not None:
-                saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
-
+        # -- Save AMP discriminator if used (NEW)
+        if hasattr(self.alg, "amp") and self.alg.amp:
+            saved_dict["amp_state_dict"] = self.alg.amp.state_dict()
+            saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
         torch.save(saved_dict, path)
 
         # upload model to external logging service
@@ -331,6 +321,9 @@ class OnPolicyRunner:
         # -- Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load AMP discriminator if used (NEW)
+        if hasattr(self.alg, "amp") and self.alg.amp:
+            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
         # -- load optimizer if used
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
@@ -338,15 +331,10 @@ class OnPolicyRunner:
             # -- RND optimizer if used
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+            # -- AMP optimizer if used
+            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer:
+                self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
         # -- load current learning iteration
-
-        # AMP (if used)
-        if hasattr(self.alg, "amp") and self.alg.amp is not None and "amp_state_dict" in loaded_dict:
-            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
-            if load_optimizer and "amp_optimizer_state_dict" in loaded_dict:
-                if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer is not None:
-                    self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
-
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
@@ -363,6 +351,9 @@ class OnPolicyRunner:
         # -- RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
+        # -- AMP
+        if hasattr(self.alg, "amp") and self.alg.amp:
+            self.alg.amp.train()
 
     def eval_mode(self):
         # -- PPO
@@ -370,6 +361,9 @@ class OnPolicyRunner:
         # -- RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()
+        # -- AMP
+        if hasattr(self.alg, "amp") and self.alg.amp:
+            self.alg.amp.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
@@ -430,9 +424,6 @@ class OnPolicyRunner:
         # resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
-        # resolve AMP config (sets time_between_frames, default replay sizes, etc.)
-        self.alg_cfg = resolve_amp_config(self.alg_cfg, self.env)
-
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -451,9 +442,13 @@ class OnPolicyRunner:
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
-        # initialize the algorithm (use the updated PPO)
+        # initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        # NEW: pass amp_cfg through to algorithm
+        amp_cfg = self.alg_cfg.pop("amp_cfg", None)
+        alg: PPO = alg_class(
+            actor_critic, device=self.device, **self.alg_cfg, amp_cfg=amp_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+        )
 
         # initialize the storage
         alg.init_storage(

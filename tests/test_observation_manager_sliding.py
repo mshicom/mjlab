@@ -26,7 +26,7 @@ class _MockEnv:
         self.action_manager = type("A", (), {"action": torch.zeros(num_envs, 1, device=device)})()
         self.command_manager = type("C", (), {"get_command": lambda self, name: torch.zeros(num_envs, 1, device=device)})()
 
-def obs_joint_pos(env):
+def obs_joint_pos(env, **kwargs):
     # Returns (N, J) tensor
     return env.scene["robot"].data.joint_pos
 
