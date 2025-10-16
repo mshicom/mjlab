@@ -38,6 +38,10 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
 
     self.events.foot_friction.params["asset_cfg"].geom_names = geom_names
     self.actions.joint_pos.scale = G1_ACTION_SCALE
+    
+    self.rewards.feet_slide.params["sensor_names"] = sensor_names
+    self.rewards.feet_slide.params["asset_cfg"].geom_names = ["left_foot1_collision", "right_foot1_collision" ]
+    
     self.rewards.air_time.params["sensor_names"] = sensor_names
 
     self.rewards.pose.params["std"] = {
@@ -66,7 +70,7 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.curriculum.command_vel = None
 
     # AMP observation term
-    self.amp_dataset.enabled = False
+    self.amp_dataset.enabled = True
     self.amp_dataset.trajectories = [
       "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz"
     ]

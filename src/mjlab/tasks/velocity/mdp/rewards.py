@@ -38,7 +38,10 @@ def track_ang_vel_exp(
   command_name: str,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Reward tracking of angular velocity commands (yaw) using exponential kernel."""
+  """Reward tracking of angular velocity commands (yaw) using exponential kernel.
+  It's 1 when the angular-velocity matches perfectly and it falls off exponentially with the squared error. 
+  That makes the policy care a lot about getting close to the target and care much less once it's far away.
+  """
   asset: Entity = env.scene[asset_cfg.name]
   command = env.command_manager.get_command(command_name)
   assert command is not None, f"Command '{command_name}' not found."

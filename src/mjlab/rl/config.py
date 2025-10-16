@@ -134,7 +134,7 @@ class RslRlPpoAlgorithmCfg:
   """The configuration for the Random Network Distillation (RND) module. Default is None,
   in which case RND is not used.
   """
-  amp_cfg: RslRlPpoAmpCfg | None = None
+  amp_cfg: RslRlPpoAmpCfg = field(default_factory=RslRlPpoAmpCfg)
   """The configuration for the Adversarial Motion Prior (AMP) module. Default is None,"""
   
 

@@ -43,11 +43,9 @@ class OnPolicyRunner:
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
-        # AMP: ensure obs_groups exists before resolvers
+        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"]["enabled"]:
+            default_sets.append("amp_state")
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
-
-        # NEW: resolve AMP configuration (validate obs key, set demo_provider if env provides it)
-        self.alg_cfg = resolve_amp_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
 
         # create the algorithm
         self.alg = self._construct_algorithm(obs)
@@ -424,6 +422,9 @@ class OnPolicyRunner:
         # resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
+        # resolve AMP configuration (validate obs key, set demo_provider if env provides it)
+        self.alg_cfg = resolve_amp_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
+        
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
@@ -444,10 +445,8 @@ class OnPolicyRunner:
 
         # initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        # NEW: pass amp_cfg through to algorithm
-        amp_cfg = self.alg_cfg.pop("amp_cfg", None)
         alg: PPO = alg_class(
-            actor_critic, device=self.device, **self.alg_cfg, amp_cfg=amp_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
         # initialize the storage

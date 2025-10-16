@@ -2,40 +2,33 @@ import os
 
 import wandb
 from rsl_rl.runners import OnPolicyRunner
-from dataclasses import asdict
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.velocity.rl.exporter import (
   attach_onnx_metadata,
   export_velocity_policy_as_onnx,
 )
-# NEW: AMP demo dataset preparation
 from mjlab.utils.dataset.motion_dataset import prepare_amp_demo
 
 
 class VelocityOnPolicyRunner(OnPolicyRunner):
   env: RslRlVecEnvWrapper
   def __init__(self, env: RslRlVecEnvWrapper, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    
+    # TODO: make prepare_amp_demo and env.unwrapped.sample_amp_demos stuff in a env wrapper
     # Prepare AMP demo dataset (if configured) before constructing OnPolicyRunner.
     # This ensures env.sample_amp_demos exists when rsl_rl resolves AMP config.
     amp_ds_cfg = getattr(env.cfg, "amp_dataset", None)
-    if amp_ds_cfg is not None and getattr(amp_ds_cfg, "enabled", False):
+    if amp_ds_cfg is not None and amp_ds_cfg.enabled:
       # build or reuse cached per-trajectory features and attach env.unwrapped.sample_amp_demos
       _ = prepare_amp_demo(
         env=env.unwrapped,  # use underlying mjlab env to access sim + observation_manager
         trajectories=amp_ds_cfg.trajectories,
-        group_name=getattr(amp_ds_cfg, "group_name", "amp_state"),
-        subsample_stride=getattr(amp_ds_cfg, "subsample_stride", 1),
-        max_frames_per_traj=getattr(amp_ds_cfg, "max_frames_per_traj", None),
-        seed=getattr(amp_ds_cfg, "seed", 42),
-        force_recompute=getattr(amp_ds_cfg, "force_recompute", False),
+        group_name=amp_ds_cfg.group_name,
+        subsample_stride=amp_ds_cfg.subsample_stride,
+        max_frames_per_traj=amp_ds_cfg.max_frames_per_traj,
+        seed=amp_ds_cfg.seed
       )
-      # Forward sampling at the wrapper level for rsl_rl AMP resolver convenience
-      if not hasattr(env, "sample_amp_demos"):
-        env.sample_amp_demos = lambda n, device=None: env.unwrapped.sample_amp_demos(n, device=device)  # type: ignore
-
-    # Copy amp_cfg from env.cfg to train_cfg to enable AMP training in rsl_rl (if present).
-    if getattr(env.cfg, "amp_cfg", None) is not None:
-      train_cfg["algorithm"]["amp_cfg"] = env.cfg.amp_cfg
+      train_cfg["algorithm"]["amp_cfg"]['enabled'] = True
 
     # Proceed with standard rsl_rl on-policy runner initialization
     super().__init__(env, train_cfg, log_dir, device)

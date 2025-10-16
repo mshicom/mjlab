@@ -38,42 +38,38 @@ class AMPConfig:
     This must point to a flattened feature vector per environment step (shape [B, F]).
     Asserts will fail if this key is missing or the shape is inconsistent.'''
 
-    hidden_dims: Tuple[int, ...] = (256, 256)
+    hidden_dims: Tuple[int, ...] = (1024, 512)
     '''Hidden layer dimensions of the discriminator MLP (backbone).'''
 
-    activation: str = "elu"
+    activation: str = "relu"
     '''Activation function name: one of {"elu", "relu", "tanh", "gelu"}.
     Asserts on unsupported names.'''
 
-    init_output_scale: float = 0.0
+    init_output_scale: float = 1.0
     '''Uniform initialization scale for the final logit layer weights.
     If > 0, logits.weight is initialized uniformly in [-scale, scale] and bias=0.
     This mirrors MimicKit's amp_model.AMPModel disc head initialization.'''
 
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     '''Discriminator optimizer learning rate. Uses Adam optimizer.'''
 
-    weight_decay: float = 0.0
+    opt_weight_decay: float = 0.0
     '''Weight decay for the optimizer (Adam). This is separate from "disc_weight_decay" below.
     The latter adds an explicit L2 penalty term to the loss, matching MimicKit.'''
 
-    logit_reg: float = 0.0
+    logit_reg: float = 0.01
     '''Coefficient for L2 penalty on the final logit layer weights ||W_logit||^2.'''
 
-    grad_penalty: float = 0.0
+    grad_penalty: float = 5.0
     '''Coefficient for gradient penalty on demo inputs: E[ ||∂D/∂x_demo||^2 ].
     Implemented exactly as in MimicKit (_compute_disc_loss).'''
 
-    disc_weight_decay: float = 0.0
+    disc_weight_decay: float = 0.0001
     '''Manual L2 penalty coefficient on all discriminator weights Σ||W||^2.
     This matches MimicKit's "disc_weight_decay" which is separate from optimizer weight_decay.'''
 
     reward_scale: float = 1.0
     '''Scale for the AMP reward r_amp = -log(max(1 - sigmoid(logit), 1e-4)) * reward_scale.'''
-
-    reward_coef: float = 1.0
-    '''Coefficient used when adding AMP reward to environment reward:
-    r_total = r_env + reward_coef * r_amp.'''
 
     eval_batch_size: int = 0
     '''Optional chunk size for reward evaluation to control memory.
@@ -239,22 +235,13 @@ class AMPDiscriminator(nn.Module):
           - Updates normalization statistics for both agent and demo inputs before evaluating loss, as in MimicKit
             (they record both agent and demo observations before updating normalizer).
         """
-        assert self.cfg.demo_provider is not None, (
-            "AMP demo_provider must be provided when AMP is enabled (see AMPConfig.demo_provider)."
-        )
-        assert agent_state.dim() == 2, f"Expected agent_state [B, F], got {tuple(agent_state.shape)}"
-
         device = agent_state.device
         B = agent_state.shape[0]
         n_demo = max(1, int(B * float(self.cfg.demo_batch_ratio)))
 
         # Sample demo batch
         demo_state = self.cfg.demo_provider(n_demo, device=device)
-        assert isinstance(demo_state, torch.Tensor), "demo_provider must return a torch.Tensor."
-        assert demo_state.dim() == 2 and demo_state.shape[1] == agent_state.shape[1], (
-            f"Demo batch must have shape [n_demo, F={agent_state.shape[1]}], got {tuple(demo_state.shape)}"
-        )
-
+        
         # Update normalization (recording step, mirrors MimicKit behavior)
         with torch.no_grad():
             self.state_norm.update(agent_state)
@@ -279,7 +266,7 @@ class AMPDiscriminator(nn.Module):
 
         # Logit weight L2 regularization
         if self.cfg.logit_reg != 0.0:
-            loss = loss + self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
+            loss += self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
 
         # Gradient penalty on demo inputs: E[||∂D/∂x_demo||^2]
         grad_penalty = torch.tensor(0.0, device=device)
@@ -295,12 +282,12 @@ class AMPDiscriminator(nn.Module):
             # Sum of squared grads over feature dimension, mean over batch
             grad_sq = torch.sum(grad * grad, dim=-1)
             grad_penalty = torch.mean(grad_sq)
-            loss = loss + self.cfg.grad_penalty * grad_penalty
+            loss += self.cfg.grad_penalty * grad_penalty
 
         # Manual discriminator weight decay over all layer weights (separate from optimizer)
         if self.cfg.disc_weight_decay != 0.0:
             all_w = self.get_all_weights()
-            loss = loss + self.cfg.disc_weight_decay * torch.sum(all_w * all_w)
+            loss += self.cfg.disc_weight_decay * torch.sum(all_w * all_w)
 
         # Accuracy metrics (fraction correct)
         agent_acc = (agent_logit < 0.0).float().mean()
@@ -331,14 +318,7 @@ class AMPDiscriminator(nn.Module):
           - obs is a mapping-like object (e.g., dict, TensorDict) supporting obs[self.cfg.obs_key].
           - Returns tensor of shape [B, F].
         """
-        assert hasattr(obs, "__getitem__"), (
-            f"Observations must be mapping-like to extract AMP state with key '{self.cfg.obs_key}'."
-        )
         x = obs[self.cfg.obs_key]
-        assert isinstance(x, torch.Tensor) and x.dim() == 2, (
-            f"AMP state '{self.cfg.obs_key}' must be a Tensor of shape [B, F], got type={type(x)}, "
-            f"shape={None if not isinstance(x, torch.Tensor) else tuple(x.shape)}."
-        )
         return x
 
 
@@ -349,7 +329,6 @@ def resolve_amp_config(alg_cfg: Dict[str, Any], obs: Any, obs_groups: Dict[str, 
         * Validate that obs contains the AMP obs_key (default "amp_state") at top-level (obs[obs_key]).
         * If env exposes a callable "sample_amp_demos(n, device) -> Tensor [n, F]" and amp_cfg lacks a demo_provider,
           assign it.
-        * Stash the env in amp_cfg["_env"] for future convenience (mirrors symmetry config pattern).
     - Otherwise, no changes.
 
     Args:
@@ -366,23 +345,16 @@ def resolve_amp_config(alg_cfg: Dict[str, Any], obs: Any, obs_groups: Dict[str, 
     amp_cfg = alg_cfg["amp_cfg"]
     if amp_cfg is None:
         return alg_cfg
-    if not amp_cfg.get("enabled", False):
+    if not amp_cfg["enabled"]:
         return alg_cfg
 
     # Validate obs_key presence
-    obs_key = amp_cfg.get("obs_key", "amp_state")
-    has_key = hasattr(obs, "__getitem__") and (obs_key in obs)
-    assert has_key, (
-        f"AMP enabled but obs does not contain key '{obs_key}'. "
-        f"Ensure your environment observation dict includes '{obs_key}'."
-    )
+    obs_key = amp_cfg["obs_key"]
+    assert amp_cfg["obs_key"] in obs, f"AMP enabled but obs does not contain key '{obs_key}'. "
 
     # Resolve demo provider from environment if not provided
     if amp_cfg.get("demo_provider", None) is None:
-        if hasattr(env, "sample_amp_demos") and callable(getattr(env, "sample_amp_demos")):
-            amp_cfg["demo_provider"] = lambda n, device: env.sample_amp_demos(n, device=device)
-        # else: leave None and assert later in PPO.init_storage
+        assert hasattr(env.unwrapped, "sample_amp_demos"), "AMP enabled but no demo_provider provided and env lacks sample_amp_demos(n, device)."
+        amp_cfg["demo_provider"] = lambda n, device: env.unwrapped.sample_amp_demos(n, device=device)
 
-    # Stash env for potential later use (mirrors symmetry resolver pattern)
-    amp_cfg["_env"] = env
     return alg_cfg

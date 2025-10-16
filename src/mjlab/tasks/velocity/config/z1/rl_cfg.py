@@ -12,11 +12,11 @@ class NuBotZ1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
   policy: RslRlPpoActorCriticCfg = field(
     default_factory=lambda: RslRlPpoActorCriticCfg(
       init_noise_std=1.0,
-      actor_obs_normalization=False,
-      critic_obs_normalization=False,
+      actor_obs_normalization=True,
+      critic_obs_normalization=True,
       actor_hidden_dims=(512, 256, 128),
       critic_hidden_dims=(512, 256, 128),
-      activation="elu",
+      activation="tanh",
     )
   )
   algorithm: RslRlPpoAlgorithmCfg = field(
@@ -29,7 +29,7 @@ class NuBotZ1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
       num_mini_batches=4,
       learning_rate=1.0e-3,
       schedule="adaptive",
-      gamma=0.99,
+      gamma=0.99,  # high discount factor shows more natural standing posture as it penalizes standing torque more than motion
       lam=0.95,
       desired_kl=0.01,
       max_grad_norm=1.0,

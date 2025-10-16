@@ -44,7 +44,7 @@ class AmpDatasetCfg:
   """
   enabled: bool = False
   group_name: str = "amp_state"
-  trajectories: List[TrajectorySpec] = field(default_factory=list)
+  trajectories: List[str] = field(default_factory=list)
   subsample_stride: int = 1
   max_frames_per_traj: Optional[int] = None
   seed: int = 42
@@ -349,7 +349,7 @@ class MotionDataset:
     self,
     mj_model: mujoco.MjModel | None = None,
     obs_manager: ObservationManager | None = None,
-    trajectories: Sequence[TrajectorySpec] = (),
+    trajectories: Sequence[Any] = (),
     group_name: str = "amp_state",
     env: Optional[Any] = None,
     device: torch.device | str = "cpu",
@@ -368,7 +368,7 @@ class MotionDataset:
         ObservationManager configured like the runtime env (must include group_name).
         If None, it must be resolved from env.observation_manager (env required).
       trajectories:
-        List of input TrajectorySpec describing the .npz files.
+        List of input path str describing the .npz files.
       group_name:
         The observation group key to extract per-frame (default 'amp_state').
       env:
@@ -403,7 +403,9 @@ class MotionDataset:
     self._mj_model = mj_model
     self._data = mujoco.MjData(self._mj_model)
     self._obs_manager = obs_manager  # used as template for cfg
-    self._specs = list(trajectories)
+    if isinstance(trajectories[0], str):
+      trajectories = [TrajectorySpec(path=p) for p in trajectories]
+    self._specs = trajectories
     self._group_name = group_name
     self._device = torch.device(device)
     self._subsample = max(1, int(subsample_stride))
@@ -510,7 +512,6 @@ class MotionDataset:
 
     for i, tr in enumerate(self._trajectories):
       cache_path = self._cache_path(tr.path)
-      loaded_from_cache = False
       if (not force_recompute) and cache_path.exists():
         try:
           payload = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -521,15 +522,11 @@ class MotionDataset:
             self._feature_dim = int(feats.shape[1])
           else:
             assert int(feats.shape[1]) == self._feature_dim, "Inconsistent feature dims across trajectories."
-          loaded_from_cache = True
+          print(f"[MotionDataset] Loaded cache '{cache_path}' with {feats.shape[0]} frames.")
+          continue
+          
         except Exception as e:
           print(f"[MotionDataset] Failed to load cache '{cache_path}': {e}. Recomputing...")
-
-      if loaded_from_cache:
-        # Reset original obs_manager as requested even when loading cache (ensure consistent external state)
-        if hasattr(self._obs_manager, "reset"):
-          self._obs_manager.reset()
-        continue
 
       # Lazily construct a local ObservationManager bound to the offline env using the same config
       if local_om is None:
@@ -867,7 +864,7 @@ class MotionDataset:
 # -----------------------
 def prepare_amp_demo(
   env: Any,
-  trajectories: Sequence[TrajectorySpec],
+  trajectories: Sequence[str],
   group_name: str = "amp_state",
   subsample_stride: int = 1,
   max_frames_per_traj: Optional[int] = None,
@@ -901,14 +898,13 @@ def prepare_amp_demo(
     - Adds env.sample_amp_demos = lambda n, device=None: dataset.sample(n, device or env.device)
   """
   # Construct dataset with auto-resolved mj_model/obs_manager from env
-  device = getattr(env, "device", "cpu")
   ds = MotionDataset(
     mj_model=None,  # auto-resolve
     obs_manager=None,  # auto-resolve
     trajectories=trajectories,
     group_name=group_name,
     env=env,
-    device=device,
+    device=env.device,
     subsample_stride=subsample_stride,
     max_frames_per_traj=max_frames_per_traj,
     seed=seed,
@@ -917,7 +913,7 @@ def prepare_amp_demo(
 
   # Attach a sampling hook on the environment for rsl_rl AMP integration
   def _sample_amp_demos(n: int, device: Optional[torch.device | str] = None) -> torch.Tensor:
-    dev = device if device is not None else getattr(env, "device", "cpu")
+    dev = device or env.device
     return ds.sample(n, device=dev)
 
   setattr(env, "sample_amp_demos", _sample_amp_demos)

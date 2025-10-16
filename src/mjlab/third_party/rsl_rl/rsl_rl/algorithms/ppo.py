@@ -122,7 +122,7 @@ class PPO:
 
         # AMP components (NEW)
         # We set up in init_storage when obs shape is available.
-        self.amp_cfg_raw = amp_cfg
+        self.amp_cfg_dict = amp_cfg
         self.amp_cfg = None
         self.amp: AMPDiscriminator | None = None
         self.amp_optimizer: optim.Optimizer | None = None
@@ -139,47 +139,16 @@ class PPO:
         )
 
         # Initialize AMP discriminator once we have observation shapes (NEW)
-        if self.amp_cfg_raw is not None and self.amp_cfg_raw.get("enabled", False):
+        if self.amp_cfg_dict is not None and self.amp_cfg_dict["enabled"]:
             # Extract amp state tensor to determine feature shape
-            assert hasattr(obs, "__getitem__"), (
-                "Observations must be mapping-like for AMP. Ensure obs is a dict-like object."
-            )
-            obs_key = self.amp_cfg_raw.get("obs_key", "amp_state")
-            assert obs_key in obs, f"AMP obs_key '{obs_key}' not present in observations."
+            obs_key = self.amp_cfg_dict["obs_key"]
             amp_state = obs[obs_key]
-            assert isinstance(amp_state, torch.Tensor) and amp_state.dim() == 2, (
-                f"AMP obs '{obs_key}' must be Tensor [B, F], got {type(amp_state)} with shape "
-                f"{None if not isinstance(amp_state, torch.Tensor) else tuple(amp_state.shape)}"
-            )
             amp_state_shape = torch.Size([amp_state.shape[1]])
 
             # Build AMPConfig and discriminator
-            cfg = AMPConfig(
-                obs_key=obs_key,
-                hidden_dims=tuple(self.amp_cfg_raw.get("hidden_dims", (256, 256))),
-                activation=self.amp_cfg_raw.get("activation", "elu"),
-                init_output_scale=float(self.amp_cfg_raw.get("init_output_scale", 0.0)),
-                learning_rate=float(self.amp_cfg_raw.get("learning_rate", 1e-4)),
-                weight_decay=float(self.amp_cfg_raw.get("weight_decay", 0.0)),
-                logit_reg=float(self.amp_cfg_raw.get("logit_reg", 0.0)),
-                grad_penalty=float(self.amp_cfg_raw.get("grad_penalty", 0.0)),
-                disc_weight_decay=float(self.amp_cfg_raw.get("disc_weight_decay", 0.0)),
-                reward_scale=float(self.amp_cfg_raw.get("reward_scale", 1.0)),
-                reward_coef=float(self.amp_cfg_raw.get("reward_coef", 1.0)),
-                eval_batch_size=int(self.amp_cfg_raw.get("eval_batch_size", 0)),
-                norm_until=self.amp_cfg_raw.get("norm_until", None),
-                demo_provider=self.amp_cfg_raw.get("demo_provider", None),
-                demo_batch_ratio=float(self.amp_cfg_raw.get("demo_batch_ratio", 1.0)),
-            )
-            # Validate demo provider presence
-            assert cfg.demo_provider is not None, (
-                "AMP is enabled but demo_provider is None. Provide 'demo_provider' in amp_cfg or implement "
-                "env.sample_amp_demos(n, device)."
-            )
-            # Instantiate discriminator and optimizer
+            self.amp_cfg = cfg = AMPConfig(**self.amp_cfg_dict)
             self.amp = AMPDiscriminator(cfg, amp_state_shape, device=self.device).to(self.device)
-            self.amp_cfg = cfg
-            self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+            self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=cfg.learning_rate, weight_decay=cfg.opt_weight_decay)
 
     def act(self, obs):
         if self.policy.is_recurrent:
@@ -199,7 +168,7 @@ class PPO:
         self.policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
-        # NEW: Update AMP normalizer and compute reward shaping
+        # TODO: warp this block into amp.get_amp_reward
         if self.amp:
             # Extract amp state and update normalization
             amp_state = self.amp.extract_state_from_obs(obs)
@@ -207,8 +176,8 @@ class PPO:
             # Compute AMP reward and add to extrinsic reward
             with torch.inference_mode():
                 amp_reward = self.amp.compute_reward(amp_state)
-            # r_total = r_env + reward_coef * r_amp
-            rewards = rewards + self.amp_cfg.reward_coef * amp_reward.unsqueeze(-1)
+            extras['amp'] = amp_reward.mean().detach()
+            rewards += amp_reward
 
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
@@ -413,9 +382,6 @@ class PPO:
 
             # -- For AMP: backward discriminator
             if self.amp:
-                assert "amp_loss" in amp_loss_dict
-                # Zero and backward AMP gradients
-                assert self.amp_optimizer is not None
                 self.amp_optimizer.zero_grad()
                 amp_loss_dict["amp_loss"].backward()
 

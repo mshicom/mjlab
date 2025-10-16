@@ -41,7 +41,11 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
 
     self.actions.joint_pos.scale = Z1_ACTION_SCALE
 
-    # self.rewards.feet_slide.params["sensor_names"] = sensor_names
+    self.rewards.feet_slide.params["sensor_names"] = sensor_names
+    self.rewards.feet_slide.params["asset_cfg"].geom_names = geom_names
+    
+    self.rewards.air_time.params["sensor_names"] = sensor_names
+    
     self.rewards.pose.params["std"] = {
       # Lower body.
       r".*hip_pitch.*": 0.3,
@@ -61,18 +65,12 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
       r".*elbow.*": 0.25,
       r".*wrist.*": 0.3,
     }
-
+    
     self.viewer.body_name = "torso_link"
     self.commands.twist.viz.z_offset = 0.75
 
     self.curriculum.command_vel = None
-    
-    self.observations.discriminator.qpos.params["asset_cfg"].joint_names=[
-      r".*_hip_.*",
-      r".*knee_.*",
-      r".*ankle_pitch.*",
-    ]
-    
+
 
 
 @dataclass
