@@ -273,7 +273,7 @@ class TerminationCfg:
     DoneTerm, func=mdp.bad_orientation, params={"limit_angle": math.radians(70.0)}
   )
   root_height_below_minimum: DoneTerm = term(
-    DoneTerm, func=mdp.root_height_below_minimum, params={"minimum_height": 0.8}
+    DoneTerm, func=mdp.root_height_below_minimum, params={"minimum_height": 0.1} # override in robot cfg.
   )
 
 

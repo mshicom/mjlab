@@ -56,6 +56,8 @@ class AMPConfig:
     opt_weight_decay: float = 0.0
     '''Weight decay for the optimizer (Adam). This is separate from "disc_weight_decay" below.
     The latter adds an explicit L2 penalty term to the loss, matching MimicKit.'''
+    
+    amp_loss_weight: float = 5.0
 
     logit_reg: float = 0.01
     '''Coefficient for L2 penalty on the final logit layer weights ||W_logit||^2.'''
@@ -84,7 +86,7 @@ class AMPConfig:
     This must return normalized-shape-compatible demos (same feature dimension as amp_state).
     Asserts in runtime if AMP is enabled and this is None.'''
 
-    demo_batch_ratio: float = 1.0
+    demo_batch_ratio: float = 0.2
     '''Ratio determining how many demo samples to draw relative to current agent batch size:
     n_demo = max(1, int(n_agent * demo_batch_ratio)).'''
 
@@ -289,6 +291,7 @@ class AMPDiscriminator(nn.Module):
             all_w = self.get_all_weights()
             loss += self.cfg.disc_weight_decay * torch.sum(all_w * all_w)
 
+        loss *= self.cfg.amp_loss_weight
         # Accuracy metrics (fraction correct)
         agent_acc = (agent_logit < 0.0).float().mean()
         demo_acc = (demo_logit > 0.0).float().mean()

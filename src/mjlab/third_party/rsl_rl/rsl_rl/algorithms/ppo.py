@@ -176,7 +176,7 @@ class PPO:
             # Compute AMP reward and add to extrinsic reward
             with torch.inference_mode():
                 amp_reward = self.amp.compute_reward(amp_state)
-            extras['amp'] = amp_reward.mean().detach()
+            extras['log']['amp'] = amp_reward.mean().detach()
             rewards += amp_reward
 
         # Record the rewards and dones

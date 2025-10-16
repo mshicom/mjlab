@@ -68,11 +68,16 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.commands.twist.viz.z_offset = 0.75
 
     self.curriculum.command_vel = None
+    
+    self.terminations.root_height_below_minimum.params["minimum_height"] = 0.4
 
     # AMP observation term
     self.amp_dataset.enabled = True
     self.amp_dataset.trajectories = [
-      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz"
+      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onestepleft.npz",
+      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onestepright.npz",
+      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onesteplong.npz",
+      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/walk.npz",
     ]
     # self.observations.discriminator.qpos.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=[
     #   ".*_hip_.*",

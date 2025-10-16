@@ -70,7 +70,8 @@ class NuBotZ1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.commands.twist.viz.z_offset = 0.75
 
     self.curriculum.command_vel = None
-
+    
+    self.terminations.root_height_below_minimum.params["minimum_height"] = 0.8
 
 
 @dataclass

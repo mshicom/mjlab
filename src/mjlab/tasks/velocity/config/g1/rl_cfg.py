@@ -49,7 +49,7 @@ class UnitreeG1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         eval_batch_size=0,
         norm_until=None,
         # demo_provider=resolved automatically from env.sample_amp_demos if present
-        demo_batch_ratio=1.0
+        demo_batch_ratio=0.1
       )
     )
   )
