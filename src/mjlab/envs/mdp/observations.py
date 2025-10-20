@@ -8,7 +8,7 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-
+from mjlab.third_party.isaaclab.isaaclab.utils.math import quat_box_minus
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_env import ManagerBasedEnv
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -23,14 +23,14 @@ _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
 def base_lin_vel(
-  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   return asset.data.root_link_lin_vel_b
 
 
 def base_ang_vel(
-  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   return asset.data.root_link_ang_vel_b
@@ -38,10 +38,12 @@ def base_ang_vel(
 
 def projected_gravity(
   env: ManagerBasedEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   return asset.data.projected_gravity_b
+
+
 
 
 ##
@@ -51,7 +53,7 @@ def projected_gravity(
 
 def joint_pos_rel(
   env: ManagerBasedEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   default_joint_pos = asset.data.default_joint_pos
@@ -62,7 +64,7 @@ def joint_pos_rel(
 
 def joint_vel_rel(
   env: ManagerBasedEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   default_joint_vel = asset.data.default_joint_vel
@@ -72,7 +74,7 @@ def joint_vel_rel(
 
 def joint_pos_abs(
   env: ManagerBasedEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   jnt_ids = asset_cfg.joint_ids
@@ -80,7 +82,7 @@ def joint_pos_abs(
 
 def joint_state(
   env: ManagerBasedEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   jnt_ids = asset_cfg.joint_ids
@@ -94,7 +96,7 @@ def joint_state(
 ##
 
 
-def last_action(env: ManagerBasedEnv, action_name: str | None = None) -> torch.Tensor:
+def last_action(env: ManagerBasedEnv, action_name: str | None = None, **kwarg) -> torch.Tensor:
   if action_name is None:
     return env.action_manager.action
   return env.action_manager.get_term(action_name).raw_action
@@ -120,3 +122,31 @@ def aggregate_cat(env: ManagerBasedRlEnv, hist: SlidingWindow, **kwarg) -> torch
   # (N, C, W) -> (N, [c_1, c_2,..., c_w])
   obs = hist().flatten(start_dim=1)
   return obs
+
+
+def base_lin_pos(
+  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
+) -> torch.Tensor:
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.root_link_pos_w
+
+def base_lin_vel_from_pos_diff(env: ManagerBasedRlEnv, hist: SlidingWindow, diff_dt: float =0.02, **kwarg) -> torch.Tensor:
+  lin_vel = hist(diff_order=1, diff_dt=diff_dt, **kwarg)
+  return lin_vel.flatten(start_dim=1)
+
+
+def base_ang_pos(
+  env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG, **kwarg
+) -> torch.Tensor:
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.root_link_quat_w
+
+def base_ang_vel_from_pos_diff(env: ManagerBasedRlEnv, hist: SlidingWindow, diff_dt: float =0.02, **kwarg) -> torch.Tensor:
+    quats = hist(**kwarg)
+    ang_vel_history = []
+    for i in range(quats.shape[2]-1):
+      q1 = quats[:, :, i]
+      q2 = quats[:, :, i + 1]
+      ang_vel = quat_box_minus(q1, q2) / diff_dt
+      ang_vel_history.append(ang_vel)
+    return torch.cat(ang_vel_history, dim=-1)

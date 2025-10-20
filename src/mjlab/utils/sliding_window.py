@@ -59,8 +59,10 @@ class SlidingWindow(torch.nn.Module):
       - layout="NCW" (default): returns (N, C, W)
       - layout="TNC": returns (T, N, C)
       replicate_pad applies per-env replicate padding when True.
-    - _get_hist_data_smooth_and_diffed(window_size, diff_order, diff_dt, poly_degree=2)
-      Returns (N, C_flat); applies per-env replicate padding internally.
+    - _get_hist_data_smooth_and_diffed(window_size, diff_order, diff_dt, poly_degree=2, output_horizon=1)
+      Returns:
+        - if output_horizon == 1: (N, C_flat) as before
+        - if output_horizon > 1: (N, C_flat, H) where H is number of produced horizon steps
 
   Notes:
     - No per-env ops on push; per-env padding is computed lazily on read when requested.
@@ -227,10 +229,19 @@ class SlidingWindow(torch.nn.Module):
     diff_order: int,
     diff_dt: float,
     poly_degree: int = 2,
+    output_horizon: int = 1,
   ) -> Tensor:
-    """Endpoint SG smoothing/differentiation at the latest sample. Returns (N, C_flat).
+    """Endpoint SG smoothing/differentiation at the latest sample.
 
-    Per-env replicate padding is applied prior to SG to correctly handle partial resets.
+    Args:
+      window_size: K, length of window used by SG for each endpoint.
+      diff_order: derivative order (0..3).
+      diff_dt: sampling period.
+      poly_degree: SG polynomial degree (clamped as needed).
+      output_horizon: how many consecutive endpoint outputs to produce by sliding the K-sized
+                      window backwards along the tail. If 1 (default), returns (N, C).
+                      If >1, returns (N, C, H) where H is number of produced outputs
+                      (we now REQUIRE K + (output_horizon - 1) <= max_window_size).
     """
     if window_size < 1:
       raise AssertionError("window_size must be >= 1")
@@ -238,32 +249,63 @@ class SlidingWindow(torch.nn.Module):
       raise AssertionError("diff_order must be in [0, 3]")
     if diff_dt <= 0.0:
       raise AssertionError("diff_dt must be positive")
+    if output_horizon < 1:
+      raise AssertionError("output_horizon must be >= 1")
 
-    T_req = min(window_size, self.max_window_size)
-    # Build chronological tail and apply per-env replicate padding on-demand; keep time-major for GEMV
-    seq_tnc = self._get_hist_data(T_req, replicate_pad=True, layout="TNC")  # (T, N, C)
+    K = int(window_size)
+    # total tail length needed to produce output_horizon endpoint outputs:
+    # T_total_req = K + (output_horizon - 1)
+    T_total_req = K + (int(output_horizon) - 1)
+    # Enforce that the requested total fits in storage; raise error otherwise.
+    if T_total_req > self.max_window_size:
+      raise AssertionError(f"Requested total tail length {T_total_req} exceeds max_window_size {self.max_window_size}")
 
-    # SG kernel for T_req with adaptive degree.
-    deg = max(diff_order, min(poly_degree, T_req - 1))
-    w = sg_endpoint_kernel(T_req, deg, diff_order, diff_dt, device=seq_tnc.device, dtype=seq_tnc.dtype)  # (T,)
+    T_total = T_total_req
 
-    # Fused GEMV: (T, N*C) @ (T,) -> (N*C,)
-    T, N, C = seq_tnc.shape
-    if T == 0:
-      return self._buffer.new_zeros((N, C))
-    seq2d = seq_tnc.reshape(T, N * C)  # contiguous view
-    out_flat = torch.mv(seq2d.t(), w)  # (N*C,)
-    return out_flat.view(N, C)
+    # Build chronological tail and apply per-env replicate padding on-demand; keep time-major for GEMV/unfold
+    seq_tnc = self._get_hist_data(T_total, replicate_pad=True, layout="TNC")  # (T_total, N, C)
+
+    # Ensure we have at least K rows; replicate_pad already helps with partial resets / global zero-pad.
+    T_actual = seq_tnc.shape[0]
+    if T_actual < K:
+      # pad to K by replicating first row
+      pad_needed = K - T_actual
+      pad = seq_tnc[:1].repeat(pad_needed, 1, 1)
+      seq_tnc = torch.cat((pad, seq_tnc), dim=0)
+      T_actual = seq_tnc.shape[0]
+
+    H = max(1, T_actual - K + 1)  # number of K-length windows available (effective horizon)
+    # At this point H should match output_horizon unless global availability was lacking pre-padding.
+
+    # Kernel for window length K (deg adaptively clamped)
+    deg = max(diff_order, min(poly_degree, K - 1))
+    w = sg_endpoint_kernel(K, deg, diff_order, diff_dt, device=seq_tnc.device, dtype=seq_tnc.dtype)  # (K,)
+
+    # Build sliding windows explicitly (avoid subtle layout/unfold surprises)
+    # windows: (H, K, N, C)
+    windows = torch.stack([seq_tnc[h : h + K] for h in range(H)], dim=0)
+
+    # Apply kernel over K: out_hnc[h,n,c] = sum_k w[k] * windows[h,k,n,c]
+    # Use einsum for clarity and correctness
+    out_hnc = torch.einsum("k,hknc->hnc", w, windows)  # (H, N, C)
+
+    if output_horizon == 1:
+      # Return single endpoint result (N, C)
+      return out_hnc[-1].contiguous() if out_hnc.shape[0] > 0 else self._buffer.new_zeros((self.num_envs, self.num_features))
+    else:
+      # Return (N, C, H) layout (user requested multi-horizon)
+      out_nch = out_hnc.permute(1, 2, 0).contiguous()  # (N, C, H)
+      return out_nch
 
   # Optional callable alias to support previous underscore API usage
-  def __call__(self, length: Optional[int] = None, diff_order: Optional[int] = None, diff_dt: Optional[float] = None, poly_degree: int = 2, *args, **kwargs):
-    T = length or self.max_window_size
+  def __call__(self, length: int = None, diff_order: int = None, diff_dt: float = None, poly_degree: int = 2, output_horizon:int = 1, *args, **kwargs):
+    T = length or (self.max_window_size-output_horizon)
     if diff_order is not None:
       if diff_dt is None:
         raise AssertionError("diff_dt must be provided if diff_order is provided")
-      return self._get_hist_data_smooth_and_diffed(T, diff_order, float(diff_dt), poly_degree)
+      return self._get_hist_data_smooth_and_diffed(T, diff_order, float(diff_dt), poly_degree, output_horizon)
     # Default to user-friendly (N, C, W)
-    return self._get_hist_data(T, replicate_pad=False, layout="NCW")
+    return self._get_hist_data(T, replicate_pad=True, layout="NCW")
 
   @property
   def length(self) -> int:

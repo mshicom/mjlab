@@ -5,6 +5,7 @@ import torch
 
 from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.observation_manager import ObservationManager
+from mjlab.utils.sliding_window import SlidingWindow, sg_endpoint_kernel
 
 
 # ----------------------
@@ -499,3 +500,54 @@ def test_cascaded_chain_two_levels_hist_reads_func_reads_src():
     assert torch.allclose(t_src, torch.full((N, J), 7.0, device=env.device))
     assert torch.allclose(t_prev, torch.full((N, J), 6.0, device=env.device))
     assert torch.allclose(t_prev_prev, torch.full((N, J), 5.0, device=env.device))
+
+
+# ----------------------
+# Tests: sliding-window multi-horizon expected-value check
+# ----------------------
+
+def test_get_hist_data_smooth_and_diffed_multi_horizon_layout_and_values():
+    N, C, W = 2, 3, 6
+    sw = SlidingWindow(num_envs=N, feature_shape=torch.Size([C]), max_window_size=W, device=torch.device("cpu"))
+
+    # Push 6 frames with increasing scalar values per frame (same across envs/channels for simplicity)
+    for t in range(6):
+        x = torch.full((N, C), float(t + 1))
+        sw.push(x)
+
+    # Request K=3, output_horizon=2 -> T_total_req = 3 + (2-1) = 4 (fits in W)
+    K = 3
+    H_req = 2
+    out = sw._get_hist_data_smooth_and_diffed(window_size=K, diff_order=0, diff_dt=1.0, poly_degree=2, output_horizon=H_req)
+    # Expect shape (N, C, H)
+    assert out.shape[0] == N and out.shape[1] == C and out.shape[2] == H_req
+
+    # Compute expected results manually using the same window-stacking + einsum approach as the impl
+    seq_tnc = sw._get_hist_data(window_size=K + (H_req - 1), replicate_pad=True, layout="TNC")  # (T_total, N, C)
+    w = sg_endpoint_kernel(K, max(0, min(2, K - 1)), 0, 1.0, device=seq_tnc.device, dtype=seq_tnc.dtype)  # (K,)
+
+    # Build overlapping windows explicitly: windows shape (H, K, N, C)
+    T_total = seq_tnc.shape[0]
+    H_eff = T_total - K + 1
+    windows = torch.stack([seq_tnc[h : h + K] for h in range(H_eff)], dim=0)  # (H, K, N, C)
+
+    # Use einsum to compute same contraction as implementation: expected_hnc (H, N, C)
+    expected_hnc = torch.einsum("k,hknc->hnc", w, windows)
+    expected_nch = expected_hnc.permute(1, 2, 0).contiguous()  # (N, C, H)
+    assert torch.allclose(out, expected_nch, atol=1e-6)
+
+
+def test_get_hist_data_smooth_and_diffed_raises_when_total_exceeds_buffer():
+    N, C, W = 2, 2, 4
+    sw = SlidingWindow(num_envs=N, feature_shape=torch.Size([C]), max_window_size=W, device=torch.device("cpu"))
+
+    # Fill with some frames
+    for t in range(4):
+        sw.push(torch.full((N, C), float(t + 1)))
+
+    # Request K=3, output_horizon=3 -> T_total_req = 3 + (3-1) = 5 > W -> should raise
+    try:
+        sw._get_hist_data_smooth_and_diffed(window_size=3, diff_order=0, diff_dt=1.0, poly_degree=2, output_horizon=3)
+    except AssertionError:
+        return
+    raise AssertionError("Expected AssertionError when requested total tail length exceeds max_window_size")
