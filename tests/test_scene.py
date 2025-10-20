@@ -1,13 +1,16 @@
 """Tests for Scene class."""
 
+from pathlib import Path
 from unittest.mock import Mock
 
 import mujoco
+import numpy as np
 import pytest
 import torch
 
-from mjlab.entity import Entity, EntityCfg
+from mjlab.entity import Entity, EntityCfg, EntityType
 from mjlab.scene import Scene, SceneCfg
+from mjlab.scene.scene import RecordCfg
 from mjlab.sim.sim_data import WarpBridge
 
 # ============================================================================
@@ -359,6 +362,46 @@ class TestSceneIntegration:
       assert entity.data is not None
       if not entity.is_fixed_base:
         assert entity.data.root_link_pose_w.shape == (3, 7)
+        
+def test_add_record_and_stream(scene_with_entities_cfg, device, tmp_path: Path):
+  """Attach a record entity, save qpos-only recording from live entity, then reload and stream."""
+  import mujoco_warp as mjwarp
+
+  scene = Scene(scene_with_entities_cfg, device)
+  model = scene.compile()
+  data = mujoco.MjData(model)
+  mujoco.mj_resetData(model, data)
+  wp_model = mjwarp.put_model(model)
+  wp_data = mjwarp.put_data(model, data, nworld=scene.num_envs)
+  wp_model = WarpBridge(wp_model, nworld=scene.num_envs)
+  wp_data = WarpBridge(wp_data)
+  scene.initialize(model, wp_model, wp_data)  # type: ignore
+
+  # Record a few frames from live 'robot'
+  robot = scene["robot"]
+  robot.start_record(frequency_hz=100.0)
+  # write some states into mjwarp data to simulate motion
+  for _ in range(3):
+    robot.add_frame()
+  out_npz = tmp_path / "robot_qpos_only.npz"
+  robot.save_record(out_npz, qpos_only=True)
+  assert out_npz.exists()
+
+  # Attach record via configuration and reinitialize to load it
+  scene._cfg.records = [
+    RecordCfg(path=out_npz, name="rec", record_frequency=100.0),
+  ]
+  scene._records.clear()
+  scene.initialize(model, wp_model, wp_data)  # type: ignore
+
+  rec = scene["rec"]
+  rec.initialize(model, wp_model, wp_data, device)  # type: ignore
+  count = 0
+  for _ in rec.frames(0, 3):
+    # nworld must be 1 for offline buffer
+    assert rec.data.data.qpos.shape[0] == 1
+    count += 1
+  assert count == 3
 
 
 if __name__ == "__main__":

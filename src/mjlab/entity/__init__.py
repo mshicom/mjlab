@@ -4,6 +4,7 @@ from mjlab.entity.entity import (
   EntityArticulationInfoCfg,
   EntityCfg,
   EntityIndexing,
+  EntityType
 )
 
 __all__ = (
@@ -12,4 +13,5 @@ __all__ = (
   "EntityArticulationInfoCfg",
   "EntityData",
   "EntityIndexing",
+  "EntityType"
 )

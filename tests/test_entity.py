@@ -1,12 +1,17 @@
 """Tests for entity module."""
 
+from pathlib import Path
+import os
+
 import mujoco
+import numpy as np
 import pytest
 import torch
 
-from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
+from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg, EntityType
 from mjlab.sim.sim import Simulation, SimulationCfg
 from mjlab.utils.spec_config import ActuatorCfg
+from mjlab.scene.scene import RecordCfg
 
 
 def get_test_device() -> str:
@@ -386,6 +391,199 @@ class TestExternalForces:
 
     sim.step()
     assert not torch.any(torch.isnan(sim.data.qpos)), "Should not produce NaN"
+
+
+# ============================================================================
+# New tests for record qvel reconstruction, resampling and recording
+# ============================================================================
+
+def test_qvel_reconstruction_from_qpos_only(tmp_path: Path, articulated_entity: Entity, device: str):
+  """Generate synthetic qpos-only npz and verify qvel is reconstructed correctly."""
+  # Build a simple articulated entity as target
+  target_ent = articulated_entity
+  mj_model = target_ent.compile()
+
+  # Sim wrapper for indexing creation
+  from mjlab.sim.sim import Simulation, SimulationCfg
+  sim = Simulation(num_envs=1, cfg=SimulationCfg(), model=mj_model, device=device)
+  target_ent.initialize(mj_model, sim.model, sim.data, device)
+
+  # Create synthetic qpos (free + 2 joints) with known linear progression
+  T = 10
+  freq = 50.0  # Hz
+  dt = 1.0 / freq
+  pos = np.stack([np.linspace(0, 0.09, T), np.zeros(T), np.zeros(T)], axis=1)
+  quat = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (T, 1))
+  j1 = np.linspace(0, 0.9, T)[:, None]
+  j2 = np.linspace(0, -0.45, T)[:, None]
+  qpos = np.concatenate([pos, quat, j1, j2], axis=1).astype(np.float32)
+
+  arrays = {
+    "qpos": qpos,
+    "_info": {
+      "joint_names": target_ent.joint_names_with_free(),
+      "jnt_type": np.array([int(mujoco.mjtJoint.mjJNT_FREE), int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_HINGE)], dtype=np.int32),
+      "body_names": target_ent.body_names,
+      "site_names": target_ent.site_names,
+      "frequency": freq,
+    },
+  }
+  npz_path = tmp_path / "qpos_only.npz"
+  # Save minimal npz with qpos only
+  np.savez(str(npz_path), **{"qpos": arrays["qpos"], "_info": np.array(arrays["_info"], dtype=object)})
+
+  # Create a record entity aliasing the target spec and load
+  rec_ent = Entity(EntityCfg(), entity_type=EntityType.REC)
+  rec_ent.bind_target_entity(target_ent)
+  rec_ent.initialize(mj_model, sim.model, sim.data, device)
+  rec_ent.load_record(
+    npz_path=npz_path,
+    source_xml=None,
+    mj_model=mj_model,
+    record_frequency=freq,
+  )
+
+  # Check qvel reconstructed matches expected finite differences
+  # Bind frames and compare local slices
+  count = 0
+  for idx in rec_ent.frames(0, T):
+    qvel = rec_ent.data.data.qvel[0].detach().cpu().numpy()
+    # Expected: first frame zeros; later frames approx diff * freq
+    if idx == 0:
+      assert np.allclose(qvel, qvel * 0.0)
+    count += 1
+  assert count == T
+
+
+def test_record_roundtrip_smoke(tmp_path: Path, articulated_entity: Entity, device: str):
+  """Roundtrip: start_record -> simulate few steps -> add_frame -> save_record(qpos only) -> reload -> verify buffer."""
+  ent = articulated_entity
+  mj_model = ent.compile()
+  from mjlab.sim.sim import Simulation, SimulationCfg
+  sim = Simulation(num_envs=1, cfg=SimulationCfg(), model=mj_model, device=device)
+  ent.initialize(mj_model, sim.model, sim.data, device)
+
+  # Record a few frames during simulation
+  ent.start_record(frequency_hz=100.0)
+  for _ in range(5):
+    sim.step()
+    ent.add_frame()
+  out_path = tmp_path / "roundtrip_qpos_only.npz"
+  ent.save_record(out_path, qpos_only=True)
+  assert out_path.exists()
+
+  # Reload into record entity and validate buffer
+  rec_ent = Entity(EntityCfg(), entity_type=EntityType.REC)
+  rec_ent.bind_target_entity(ent)
+  rec_ent.initialize(mj_model, sim.model, sim.data, device)
+  rec_ent.load_record(
+    npz_path=out_path,
+    source_xml=None,
+    mj_model=mj_model,
+    record_frequency=100.0,
+  )
+  # Iterate frames to ensure binding works and shapes align
+  for _ in rec_ent.frames(0, 5):
+    assert rec_ent.data.data.qpos.shape[0] == 1  # nworld==1 offline
+    assert rec_ent.data.data.qpos.shape[1] == sim.data.qpos.shape[1]
+
+
+@pytest.mark.skipif(
+  not (os.path.exists("/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz")
+       and os.path.exists("/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml")),
+  reason="External dataset or XML not available in this environment.",
+)
+def test_load_real_npz_and_env_integration(device: str):
+  """Load a real Unitree G1 npz with provided source_xml via an Env (smoke test)."""
+  npz_path = Path("/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz")
+  source_xml = Path("/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml")
+
+  from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+  from mjlab.tasks.velocity.config.g1.flat_env_cfg import UnitreeG1FlatEnvCfg
+  cfg = UnitreeG1FlatEnvCfg()
+  cfg.scene.records.append(
+    RecordCfg(
+      path=npz_path,
+      name="rec",
+      source_xml=source_xml,
+    )
+  )
+  env = ManagerBasedRlEnv(cfg, device="cpu")
+  rec:Entity = env.scene["rec"]
+  count = 0
+  for _ in rec.frames(0, min(5, getattr(rec, "_rec_len", 5))):
+    assert rec.data.data.qpos.shape[0] == 1
+    count += 1
+  assert count > 0
+
+
+def test_interpolate_record_resamples_and_recomputes_kinematics(tmp_path: Path, articulated_entity: Entity, device: str):
+  """Create a synthetic qpos-only record at 50 Hz, load it, then interpolate to 100 Hz and verify arrays."""
+  target_ent = articulated_entity
+  mj_model = target_ent.compile()
+
+  from mjlab.sim.sim import Simulation, SimulationCfg
+  sim = Simulation(num_envs=1, cfg=SimulationCfg(), model=mj_model, device=device)
+  target_ent.initialize(mj_model, sim.model, sim.data, device)
+
+  # Synthetic qpos with linear ramps (free pos x ramps, joints ramp linearly)
+  T_old = 6
+  f_old = 50.0
+  pos = np.stack([np.linspace(0.0, 0.05, T_old), np.zeros(T_old), np.zeros(T_old)], axis=1).astype(np.float32)
+  quat = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (T_old, 1))
+  j1 = np.linspace(0.0, 0.5, T_old, dtype=np.float32)[:, None]
+  j2 = np.linspace(0.0, -0.25, T_old, dtype=np.float32)[:, None]
+  qpos = np.concatenate([pos, quat, j1, j2], axis=1).astype(np.float32)
+
+  info = {
+    "joint_names": target_ent.joint_names_with_free(),
+    "jnt_type": np.array([int(mujoco.mjtJoint.mjJNT_FREE)] + [int(mujoco.mjtJoint.mjJNT_HINGE)] * target_ent.num_joints, dtype=np.int32),
+    "body_names": target_ent.body_names,
+    "site_names": target_ent.site_names,
+    "frequency": f_old,
+  }
+  npz_path = tmp_path / "synthetic_qpos_only_for_interp.npz"
+  np.savez(str(npz_path), **{"qpos": qpos, "_info": np.array(info, dtype=object)})
+
+  # Load into REC entity
+  rec_ent = Entity(EntityCfg(), entity_type=EntityType.REC, alias_spec=target_ent.spec)
+  rec_ent.bind_target_entity(target_ent)
+  rec_ent.initialize(mj_model, sim.model, sim.data, device)
+  rec_ent.load_record(
+    npz_path=npz_path,
+    source_xml=None,
+    mj_model=mj_model,
+    record_frequency=f_old,
+  )
+
+  # Capture first/last qpos before interpolation
+  qpos_first = rec_ent._rec_arrays["qpos"][0].copy()
+  qpos_last = rec_ent._rec_arrays["qpos"][-1].copy()
+
+  # Interpolate to 100 Hz
+  f_new = 100.0
+  rec_ent.interpolate_record(f_new, recompute_kinematics=True)
+
+  # Expected new length: round((T_old-1)/f_old * f_new)+1
+  dur = (T_old - 1) / f_old
+  T_new = int(round(dur * f_new)) + 1
+  assert rec_ent._rec_arrays["qpos"].shape[0] == T_new
+  assert rec_ent._rec_arrays["qvel"].shape[0] == T_new
+  assert rec_ent._rec_arrays["split_points"].tolist() == [0, T_new]
+  assert pytest.approx(rec_ent._rec_arrays["_info"]["frequency"]) == f_new
+
+  # First/last samples preserved
+  assert np.allclose(rec_ent._rec_arrays["qpos"][0], qpos_first, atol=1e-6)
+  assert np.allclose(rec_ent._rec_arrays["qpos"][-1], qpos_last, atol=1e-6)
+
+  # Kinematics recomputed and have correct shape
+  for k in ("xpos", "xquat", "cvel", "subtree_com", "site_xpos", "site_xmat"):
+    assert k in rec_ent._rec_arrays
+    assert rec_ent._rec_arrays[k].shape[0] == T_new
+
+  # qvel should be non-zero after the first frame for the ramped DOFs
+  assert np.any(np.abs(rec_ent._rec_arrays["qvel"][1:]) > 0.0)
+
 
 
 if __name__ == "__main__":

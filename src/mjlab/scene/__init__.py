@@ -1,3 +1,3 @@
-from mjlab.scene.scene import Scene, SceneCfg
+from mjlab.scene.scene import Scene, SceneCfg, RecordCfg
 
-__all__ = ["Scene", "SceneCfg"]
+__all__ = ["Scene", "SceneCfg", "RecordCfg"]
