@@ -530,7 +530,7 @@ class Entity:
 
     self._data = EntityData(
       indexing=indexing,
-      data=data if self._type is EntityType.ENV else self._maybe_create_offline_buffer(data, model, device),
+      data=data if self._type is EntityType.ENV else self._maybe_create_offline_buffer(mj_model, device),
       model=model,
       device=device,
       default_root_state=default_root_state,
@@ -552,17 +552,18 @@ class Entity:
     if self._type is EntityType.REC and self._rec_arrays is not None:
       self._bind_rec_frame(self._rec_frame)
 
-  def _maybe_create_offline_buffer(self, data: mjwarp.Data, model: mjwarp.Model, device: str) -> _RecordDataBuffer:
-    """Instantiate the offline data buffer sized to the compiled model.
+  def _maybe_create_offline_buffer(self, mj_model: mujoco.MjModel, device: str) -> _RecordDataBuffer:
+    """Instantiate the offline data buffer sized to the compiled mujoco model.
 
+    Uses mujoco.MjModel sizes to avoid triggering warp conversions on mjwarp.Data.
     nworld is forced to 1 for offline buffer.
     """
     buf = _RecordDataBuffer(
-      nq=data.qpos.shape[-1],
-      nv=data.qvel.shape[-1],
-      nbody=data.xpos.shape[-2],
-      nsite=data.site_xpos.shape[-2],
-      nu=data.ctrl.shape[-1],
+      nq=mj_model.nq,
+      nv=mj_model.nv,
+      nbody=mj_model.nbody,
+      nsite=mj_model.nsite,
+      nu=mj_model.nu,
       device=device,
     )
     self._rec_buffer = buf
@@ -724,16 +725,31 @@ class Entity:
     qvel_local = self._data.data.qvel[:, self.indexing.free_joint_v_adr.tolist() + self.indexing.joint_v_adr.tolist()]
 
     def gather_b(t: torch.Tensor) -> np.ndarray:
-      return t[0].detach().cpu().numpy()
+      return t[0].detach().cpu().numpy().astype(np.float32)
 
     self._record_frames["qpos"].append(gather_b(qpos_local))
     self._record_frames["qvel"].append(gather_b(qvel_local))
-    self._record_frames["xpos"].append(gather_b(self._data.data.xpos[:, self.indexing.body_ids]))
-    self._record_frames["xquat"].append(gather_b(self._data.data.xquat[:, self.indexing.body_ids]))
-    self._record_frames["cvel"].append(gather_b(self._data.data.cvel[:, self.indexing.body_ids]))
-    self._record_frames["subtree_com"].append(gather_b(self._data.data.subtree_com[:, self.indexing.body_ids]))
-    self._record_frames["site_xpos"].append(gather_b(self._data.data.site_xpos[:, self.indexing.site_ids]))
-    self._record_frames["site_xmat"].append(gather_b(self._data.data.site_xmat[:, self.indexing.site_ids]))
+
+    # Body-level arrays (safe when there is at least one body)
+    if self.indexing.body_ids.numel() > 0:
+      self._record_frames["xpos"].append(gather_b(self._data.data.xpos[:, self.indexing.body_ids]))
+      self._record_frames["xquat"].append(gather_b(self._data.data.xquat[:, self.indexing.body_ids]))
+      self._record_frames["cvel"].append(gather_b(self._data.data.cvel[:, self.indexing.body_ids]))
+      self._record_frames["subtree_com"].append(gather_b(self._data.data.subtree_com[:, self.indexing.body_ids]))
+    else:
+      # Shouldn't happen in practice, but keep shapes consistent
+      self._record_frames["xpos"].append(np.zeros((0, 3), dtype=np.float32))
+      self._record_frames["xquat"].append(np.zeros((0, 4), dtype=np.float32))
+      self._record_frames["cvel"].append(np.zeros((0, 6), dtype=np.float32))
+      self._record_frames["subtree_com"].append(np.zeros((0, 3), dtype=np.float32))
+
+    # Site-level arrays: avoid touching warp buffers when there are no sites
+    if self.indexing.site_ids.numel() > 0:
+      self._record_frames["site_xpos"].append(gather_b(self._data.data.site_xpos[:, self.indexing.site_ids]))
+      self._record_frames["site_xmat"].append(gather_b(self._data.data.site_xmat[:, self.indexing.site_ids]))
+    else:
+      self._record_frames["site_xpos"].append(np.zeros((0, 3), dtype=np.float32))
+      self._record_frames["site_xmat"].append(np.zeros((0, 9), dtype=np.float32))
 
   def save_record(self, rec_npz_path: Path, *, qpos_only: bool = False) -> None:
     """Finalize and save the in-memory recording to a record npz.

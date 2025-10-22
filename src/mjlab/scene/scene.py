@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+from contextlib import contextmanager
 
 import mujoco
 import mujoco_warp as mjwarp
@@ -40,6 +41,9 @@ class Scene:
     self._terrain: TerrainImporter | None = None
     self._default_env_origins: torch.Tensor | None = None
     self._records: dict[str, Entity] = {}
+
+    # NEW: alias map to transparently redirect logical names to actual entities (e.g., "robot" -> "rec")
+    self._aliases: dict[str, str] = {}
 
     self._spec = mujoco.MjSpec.from_file(str(_SCENE_XML))
     if self._cfg.extent is not None:
@@ -100,6 +104,10 @@ class Scene:
     return self._device
 
   def __getitem__(self, key: str) -> Any:
+    # Resolve alias if present
+    if key in self._aliases:
+      key = self._aliases[key]
+
     if key == "terrain":
       if self._terrain is None:
         raise KeyError("No terrain configured in this scene.")
@@ -112,10 +120,33 @@ class Scene:
       return self._records[key]
 
     # Not found, raise helpful error.
-    available = list(self._entities.keys())
+    available = list(self._entities.keys()) + list(self._records.keys())
     if self._terrain is not None:
       available.append("terrain")
     raise KeyError(f"Scene element '{key}' not found. Available: {available}")
+
+  # NEW: alias management
+
+  def set_alias(self, logical_name: str, actual_name: str) -> None:
+    """Make scene[logical_name] return scene[actual_name] transparently."""
+    self._aliases[logical_name] = actual_name
+
+  def clear_alias(self, logical_name: str | None = None) -> None:
+    """Clear a specific alias or all aliases."""
+    if logical_name is None:
+      self._aliases.clear()
+    else:
+      self._aliases.pop(logical_name, None)
+
+  @contextmanager
+  def alias(self, mapping: dict[str, str]) -> Iterator[None]:
+    """Context manager to temporarily apply a set of aliases."""
+    old = self._aliases.copy()
+    try:
+      self._aliases.update(mapping)
+      yield
+    finally:
+      self._aliases = old
 
   # Methods.
 

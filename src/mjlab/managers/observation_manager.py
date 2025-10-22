@@ -23,6 +23,11 @@ class ObservationManager(ManagerBase):
     # Map of per-term output dims (post-aggregation) and raw dims (pre-aggregation)
     self._group_obs_term_raw_dim: dict[str, list[tuple[int, ...]]] = {}
 
+    # NEW: flags for offline computation
+    self._temp_disable_noise: bool = False
+    self._in_offline: bool = False
+    self._offline_excluded_terms: set[str] = set()
+
     super().__init__(env=env)
     
     # Compute final per-group dims for presentation/concatenation
@@ -91,6 +96,10 @@ class ObservationManager(ManagerBase):
       msg += table.get_string()
       msg += "\n"
     return msg
+
+  # NEW: configure knob for offline-excluded terms
+  def set_offline_excluded_terms(self, terms: Sequence[str]) -> None:
+    self._offline_excluded_terms = set(terms)
 
   def get_active_iterable_terms(
     self, env_idx: int
@@ -161,6 +170,45 @@ class ObservationManager(ManagerBase):
     self._obs_buffer = obs_buffer
     return obs_buffer
 
+  # NEW: transparent offline computation using scene aliasing
+  def compute_on_record(
+    self,
+    record_entity_name: str,
+    *,
+    logical_target_name: str = "robot",
+    reset_windows: bool = False,
+    disable_noise: bool = True,
+    exclude_terms: Sequence[str] | None = None,
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Compute observations while transparently redirecting 'logical_target_name' to 'record_entity_name'.
+
+    - Observation functions and params are unchanged.
+    - Sliding windows can be reset at the start of a clip to avoid history leakage.
+    - Noise/corruption can be disabled for deterministic offline features.
+    - Terms listed in exclude_terms (or preconfigured via set_offline_excluded_terms) are zero-filled to preserve shapes.
+
+    Returns shape-identical dict to compute().
+    """
+    if reset_windows:
+      for group_windows in self._sliding_windows.values():
+        for win in group_windows.values():
+          win.reset(env_ids=None)
+
+    original_disable_noise = self._temp_disable_noise
+    original_in_offline = self._in_offline
+    original_excluded = self._offline_excluded_terms.copy()
+    try:
+      self._temp_disable_noise = bool(disable_noise)
+      self._in_offline = True
+      if exclude_terms is not None:
+        self._offline_excluded_terms = set(exclude_terms)
+      with self._env.scene.alias({logical_target_name: record_entity_name}):
+        return self.compute()
+    finally:
+      self._temp_disable_noise = original_disable_noise
+      self._in_offline = original_in_offline
+      self._offline_excluded_terms = original_excluded
+
   def compute_group(self, group_name: str) -> torch.Tensor | dict[str, torch.Tensor]:
     group_term_names = self._group_obs_term_names[group_name]
     group_obs: dict[str, torch.Tensor] = {}
@@ -168,6 +216,19 @@ class ObservationManager(ManagerBase):
       group_term_names, self._group_obs_term_cfgs[group_name], strict=False
     )
     for term_name, term_cfg in obs_terms:
+      # Offline exclusion: produce zeros with correct shape (post-aggregation) and skip computation
+      if self._in_offline and term_name in self._offline_excluded_terms:
+        out_dims = self._group_obs_term_dim[group_name][
+          self._group_obs_term_names[group_name].index(term_name)
+        ]
+        zeros = torch.zeros(
+          (self._env.num_envs, *out_dims),
+          device=torch.device(self._env.device),
+          dtype=torch.float32,
+        )
+        group_obs[term_name] = zeros
+        continue
+
       # 1) Compute raw per-step observation from source function.
       # Always pass params at runtime (per request).
       obs_raw: torch.Tensor = term_cfg.func(self._env, **term_cfg.params).clone()
@@ -183,11 +244,12 @@ class ObservationManager(ManagerBase):
       else:
         obs = obs_raw
 
-      # 3) Noise / corruption.
-      if isinstance(term_cfg.noise, noise_cfg.NoiseCfg):
-        obs = term_cfg.noise.apply(obs)
-      elif isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
-        obs = self._group_obs_class_instances[term_name](obs)
+      # 3) Noise / corruption (may be temporarily disabled for offline)
+      if not self._temp_disable_noise:
+        if isinstance(term_cfg.noise, noise_cfg.NoiseCfg):
+          obs = term_cfg.noise.apply(obs)
+        elif isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
+          obs = self._group_obs_class_instances[term_name](obs)
 
       # 4) Optional clip.
       if term_cfg.clip is not None:

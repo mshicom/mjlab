@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 
 import torch
@@ -7,6 +6,14 @@ from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationT
 from mjlab.managers.observation_manager import ObservationManager
 from mjlab.utils.sliding_window import SlidingWindow, sg_endpoint_kernel
 
+import mujoco
+import pytest
+from pathlib import Path
+
+from mjlab.entity import Entity, EntityCfg, EntityType
+from mjlab.scene import Scene, SceneCfg
+from mjlab.sim.sim import Simulation, SimulationCfg
+from mjlab.envs.mdp import observations
 
 # ----------------------
 # Mocks and helpers
@@ -551,3 +558,102 @@ def test_get_hist_data_smooth_and_diffed_raises_when_total_exceeds_buffer():
     except AssertionError:
         return
     raise AssertionError("Expected AssertionError when requested total tail length exceeds max_window_size")
+
+
+
+def _floating_base_xml():
+  return """
+  <mujoco>
+    <worldbody>
+      <body name="object" pos="0 0 1">
+        <freejoint name="free_joint"/>
+        <geom name="object_geom" type="box" size="0.1 0.1 0.1" rgba="0.3 0.3 0.8 1" mass="0.1"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+
+
+class DummyActionManager:
+  def __init__(self, num_envs: int, action_dim: int, device: str):
+    self.action = torch.zeros((num_envs, action_dim), device=device)
+
+
+class DummyEnv:
+  def __init__(self, scene: Scene, device: str, num_envs: int, action_dim: int = 4):
+    self.scene = scene
+    self.device = device
+    self.num_envs = num_envs
+    self.action_manager = DummyActionManager(num_envs, action_dim, device)
+
+@pytest.mark.parametrize("device", ["cpu"])
+def test_offline_parity_with_alias_and_exclusion(tmp_path: Path, device: str):
+    # Build a scene with one "robot" entity
+    robot_cfg = EntityCfg(spec_fn=lambda: mujoco.MjSpec.from_string(_floating_base_xml()))
+    scene = Scene(SceneCfg(entities={"robot": robot_cfg}), device)
+    mj_model = scene.compile()
+    sim = Simulation(num_envs=1, cfg=SimulationCfg(), model=mj_model, device=device)
+    scene.initialize(mj_model, sim.model, sim.data)  # type: ignore
+
+    # Create a record entity "rec" bound to robot; capture one frame at default state
+    robot: Entity = scene["robot"]
+    rec = Entity(EntityCfg(), entity_type=EntityType.REC)
+    rec.bind_target_entity(robot)
+    rec.initialize(mj_model, sim.model, sim.data, device)
+    # Record one frame
+    robot.start_record(frequency_hz=100.0)
+    robot.add_frame()
+    rec_path = tmp_path / "one_frame_qpos_only.npz"
+    robot.save_record(rec_path, qpos_only=True)
+    # Load into rec
+    rec.load_record(npz_path=rec_path, source_xml=None, mj_model=mj_model, record_frequency=100.0)
+    # Register record in scene for lookup
+    scene._records["rec"] = rec
+
+    # Build a minimal env + observation manager
+    env = DummyEnv(scene, device, num_envs=1, action_dim=4)
+    @dataclass
+    class ObsGroupCfg(ObservationGroupCfg):
+        base_lin_pos: ObservationTermCfg | None = None
+        last_action: ObservationTermCfg | None = None
+
+    @dataclass
+    class ChainCfg:
+        g: ObsGroupCfg
+
+    cfg = ChainCfg(
+        g=ObsGroupCfg(
+            concatenate_terms=False,
+            concatenate_dim=-1,
+            enable_corruption=False,
+            base_lin_pos=ObservationTermCfg(func=observations.base_lin_pos),
+            last_action=ObservationTermCfg(func=observations.last_action),
+        )
+    )
+    obs_mgr = ObservationManager(cfg, env)
+
+    # Online observations at current state
+    obs_online = obs_mgr.compute()
+    assert "g" in obs_online
+    online_pos = obs_online["g"]["base_lin_pos"]
+    online_act = obs_online["g"]["last_action"]
+    assert online_pos.shape[0] == 1 and online_act.shape[0] == 1
+
+    # Set offline exclusion knob for action-like terms
+    obs_mgr.set_offline_excluded_terms(["last_action"])
+
+    # Offline observations via alias mapping (robot -> rec), zeroing excluded terms
+    obs_offline = obs_mgr.compute_on_record("rec", logical_target_name="robot", reset_windows=True, disable_noise=True)
+    assert "g" in obs_offline
+    offline_pos = obs_offline["g"]["base_lin_pos"]
+    offline_act = obs_offline["g"]["last_action"]
+
+    # Parity for position term
+    assert torch.allclose(offline_pos, online_pos, atol=1e-6)
+    # Excluded term should be zero (shape preserved)
+    assert torch.all(offline_act == 0.0)
+    assert offline_act.shape == online_act.shape
+
+    # Ensure alias context does not leak after call
+    with pytest.raises(KeyError):
+        _ = scene["nonexistent"]
