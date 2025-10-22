@@ -456,6 +456,9 @@ class Entity:
     self.indexing = indexing
     nworld = data.nworld
 
+    # Store the compiled mj_model so offline methods can use it without compiling child spec.
+    self._mj_model = mj_model
+    
     # Root state - only for movable entities.
     if not self.is_fixed_base:
       default_root_state = (
@@ -611,7 +614,10 @@ class Entity:
         "Record _info missing or incomplete. Provide a valid source_xml to reconstruct metadata."
       )
       info = _info_from_xml(source_xml)
-
+    # loco-mujoco compatibility: try to get from arrays directly
+    if "frequency" not in info:
+      info["frequency"] = arrays.get("frequency", None)
+    
     # Recover qvel if missing
     if "qvel" not in arrays or arrays["qvel"].size == 0:
       freq = record_frequency if record_frequency is not None else info.get("frequency", None)
@@ -652,7 +658,8 @@ class Entity:
 
     # Optionally resample to requested frequency.
     if resample_to_frequency is not None:
-      self.interpolate_record(resample_to_frequency, recompute_kinematics=True)
+      # Use the mj_model passed into load_record whenever available (preferred).
+      self.interpolate_record(resample_to_frequency, recompute_kinematics=True, mj_model=mj_model)
 
     if self._rec_buffer is not None:
       self._bind_rec_frame(0)
@@ -707,10 +714,7 @@ class Entity:
     if frequency_hz is not None:
       self._record_info["frequency"] = float(frequency_hz)
     # Embed compiled XML for 3rd-party tools
-    try:
-      self._record_mjcf_xml = self.spec.to_xml()
-    except Exception:
-      self._record_mjcf_xml = "<!-- Failed to embed XML -->"
+    self._record_mjcf_xml = self.cfg.spec_fn().to_xml()
       
   def add_frame(self) -> None:
     """Append a frame from current self._data into the in-memory recording buffer."""
@@ -762,7 +766,7 @@ class Entity:
 
   # Resampling / speed alignment.
 
-  def interpolate_record(self, new_frequency: float, *, recompute_kinematics: bool = True) -> None:
+  def interpolate_record(self, new_frequency: float, *, recompute_kinematics: bool = True, mj_model: mujoco.MjModel | None = None) -> None:
     """Resample currently loaded record to a new frequency and update internal buffers.
 
     - qpos is linearly interpolated for translational/scalar joints.
@@ -775,9 +779,16 @@ class Entity:
     Args:
       new_frequency: Target sampling frequency in Hz.
       recompute_kinematics: Whether to recompute kinematic arrays from the model.
+      mj_model: Optional compiled mujoco.MjModel to use for mj_forward. If not provided, the entity must have been initialized previously (which stores mj_model on the entity).
     """
     assert self._type is EntityType.REC and self._rec_arrays is not None, "No record loaded."
     assert new_frequency > 0
+
+    # Prefer mj_model argument, fall back to stored _mj_model set at initialize().
+    mjm = mj_model if mj_model is not None else getattr(self, "_mj_model", None)
+    if recompute_kinematics and mjm is None:
+      raise AssertionError("mj_model is required to recompute kinematics; provide mj_model or call initialize() before interpolate_record()")
+
     info = self._rec_arrays.get("_info", {})
     old_freq = info.get("frequency", None)
     assert old_freq is not None and old_freq > 0, "Original record frequency missing to resample."
@@ -787,6 +798,10 @@ class Entity:
     # Build time vectors in seconds
     dur = (T_old - 1) / old_freq if T_old > 1 else 0.0
     if dur == 0.0:
+      # Update meta even if no-op to keep consistency
+      self._rec_arrays["_info"]["frequency"] = float(new_frequency)
+      self._rec_len = self._rec_arrays["qpos"].shape[0]
+      self._rec_frame = min(self._rec_frame, max(0, self._rec_len - 1))
       return
     t_old = np.linspace(0.0, dur, T_old, dtype=np.float64)
     T_new = int(round(dur * new_frequency)) + 1
@@ -795,8 +810,11 @@ class Entity:
 
     # Helpers
     def lininterp(arr: np.ndarray) -> np.ndarray:
-      return np.stack([np.interp(t_new, t_old, arr[:, d]) for d in range(arr.shape[1])], axis=1).astype(np.float32)
+      # arr shape (T, D)
+      out = np.stack([np.interp(t_new, t_old, arr[:, d]) for d in range(arr.shape[1])], axis=1)
+      return out.astype(np.float32)
 
+    # Split qpos into free and joints based on entity layout
     if self._free_joint is not None:
       pos_old = qpos[:, :3]
       quat_old = qpos[:, 3:7]  # wxyz
@@ -808,6 +826,7 @@ class Entity:
     else:
       qpos_new = lininterp(qpos)
 
+    # qvel from qpos
     jnames = self.joint_names_with_free()
     jtypes = _jnt_type_vector(self)
     qvel_new = _recover_qvel_from_qpos(qpos_new, jnames, jtypes, new_frequency)
@@ -815,16 +834,18 @@ class Entity:
     # Update arrays
     self._rec_arrays["qpos"] = qpos_new
     self._rec_arrays["qvel"] = qvel_new
-    # Update split_points
     self._rec_arrays["split_points"] = np.array([0, T_new], dtype=np.int64)
-    # Persist new frequency
     self._rec_arrays["_info"]["frequency"] = float(new_frequency)
+
+    # IMPORTANT: keep derived counters in sync to avoid OOB during frames()
+    self._rec_len = T_new
+    if self._rec_frame >= self._rec_len:
+      self._rec_frame = max(0, self._rec_len - 1)
 
     # Recompute kinematics if requested
     if recompute_kinematics:
-      mj_model = self.spec.compile()
       xpos, xquat, cvel, subtree_com, site_xpos, site_xmat = self._compute_rest_via_forward(
-        mj_model=mj_model,
+        mj_model=mjm,
         qpos_local=qpos_new,
         qvel_local=qvel_new,
       )

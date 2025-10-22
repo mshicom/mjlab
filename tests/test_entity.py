@@ -517,8 +517,9 @@ def test_load_real_npz_and_env_integration(device: str):
   assert count > 0
 
 
-def test_interpolate_record_resamples_and_recomputes_kinematics(tmp_path: Path, articulated_entity: Entity, device: str):
-  """Create a synthetic qpos-only record at 50 Hz, load it, then interpolate to 100 Hz and verify arrays."""
+@pytest.mark.parametrize("f_new", [25.0, 100.0])
+def test_interpolate_record_resamples_and_recomputes_kinematics(tmp_path: Path, articulated_entity: Entity, device: str, f_new: float):
+  """Create a synthetic qpos-only record at 50 Hz, load it, then interpolate to new frequency and verify arrays."""
   target_ent = articulated_entity
   mj_model = target_ent.compile()
 
@@ -542,7 +543,7 @@ def test_interpolate_record_resamples_and_recomputes_kinematics(tmp_path: Path, 
     "site_names": target_ent.site_names,
     "frequency": f_old,
   }
-  npz_path = tmp_path / "synthetic_qpos_only_for_interp.npz"
+  npz_path = tmp_path / f"synthetic_qpos_only_for_interp_{f_new}.npz"
   np.savez(str(npz_path), **{"qpos": qpos, "_info": np.array(info, dtype=object)})
 
   # Load into REC entity
@@ -560,8 +561,7 @@ def test_interpolate_record_resamples_and_recomputes_kinematics(tmp_path: Path, 
   qpos_first = rec_ent._rec_arrays["qpos"][0].copy()
   qpos_last = rec_ent._rec_arrays["qpos"][-1].copy()
 
-  # Interpolate to 100 Hz
-  f_new = 100.0
+  # Interpolate to new frequency
   rec_ent.interpolate_record(f_new, recompute_kinematics=True)
 
   # Expected new length: round((T_old-1)/f_old * f_new)+1
