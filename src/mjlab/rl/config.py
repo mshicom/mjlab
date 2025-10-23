@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, MISSING
 from typing import ClassVar, Literal, Tuple
 from rsl_rl.modules.amp import AMPConfig
+from rsl_rl.modules.add import ADDConfig
 
 @dataclass
 class RslRlSymmetryCfg:
@@ -65,8 +66,9 @@ class RslRlRndCfg:
   target_hidden_dims: Tuple[int] = (-1)
   """The hidden dimensions for the RND target network. Default is [-1]."""
 
-
-RslRlPpoAmpCfg = AMPConfig  # alias for clarity
+# alias for clarity
+RslRlPpoAmpCfg = AMPConfig  
+RslRlPpoAddCfg = ADDConfig 
   
   
 @dataclass
@@ -136,7 +138,8 @@ class RslRlPpoAlgorithmCfg:
   """
   amp_cfg: RslRlPpoAmpCfg = field(default_factory=RslRlPpoAmpCfg)
   """The configuration for the Adversarial Motion Prior (AMP) module. Default is None,"""
-  
+  add_cfg: RslRlPpoAddCfg = field(default_factory=RslRlPpoAddCfg)
+  """The configuration for the Adversarial Differential Discriminators (ADD) module. Default is None,"""
 
 @dataclass
 class RslRlBaseRunnerCfg:

@@ -15,8 +15,8 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
-# NEW: AMP imports
 from rsl_rl.modules.amp import AMPDiscriminator, AMPConfig
+from rsl_rl.modules.add import ADDDiscriminator, ADDConfig
 
 
 class PPO:
@@ -48,6 +48,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # AMP parameters (NEW)
         amp_cfg: dict | None = None,
+        # ADD parameters (NEW)
+        add_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -127,6 +129,12 @@ class PPO:
         self.amp: AMPDiscriminator | None = None
         self.amp_optimizer: optim.Optimizer | None = None
 
+        # ADD components (NEW)
+        self.add_cfg_dict = add_cfg
+        self.add_cfg = None
+        self.add: ADDDiscriminator | None = None
+        self.add_optimizer: optim.Optimizer | None = None
+
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
         self.storage = RolloutStorage(
@@ -139,16 +147,30 @@ class PPO:
         )
 
         # Initialize AMP discriminator once we have observation shapes (NEW)
-        if self.amp_cfg_dict is not None and self.amp_cfg_dict["enabled"]:
+        if self.amp_cfg_dict is not None and self.amp_cfg_dict.get("enabled", False):
             # Extract amp state tensor to determine feature shape
             obs_key = self.amp_cfg_dict["obs_key"]
+            assert obs_key in obs, f"AMP obs key '{obs_key}' not found in observations."
             amp_state = obs[obs_key]
             amp_state_shape = torch.Size([amp_state.shape[1]])
 
             # Build AMPConfig and discriminator
             self.amp_cfg = cfg = AMPConfig(**self.amp_cfg_dict)
             self.amp = AMPDiscriminator(cfg, amp_state_shape, device=self.device).to(self.device)
-            self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=cfg.learning_rate, weight_decay=cfg.opt_weight_decay)
+            self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=cfg.learning_rate, weight_decay=getattr(cfg, "disc_weight_decay", 0.0))
+
+        # Initialize ADD discriminator once we have observation shapes (NEW)
+        if self.add_cfg_dict is not None and self.add_cfg_dict.get("enabled", False):
+            # Extract add state tensor to determine feature shape
+            obs_key = self.add_cfg_dict["obs_key"]
+            assert obs_key in obs, f"ADD obs key '{obs_key}' not found in observations."
+            add_state = obs[obs_key]
+            add_state_shape = torch.Size([add_state.shape[1]])
+
+            # Build ADDConfig and discriminator
+            self.add_cfg = add_cfg = ADDConfig(**self.add_cfg_dict)
+            self.add = ADDDiscriminator(add_cfg, add_state_shape, device=self.device).to(self.device)
+            self.add_optimizer = optim.Adam(self.add.parameters(), lr=add_cfg.learning_rate, weight_decay=getattr(add_cfg, "disc_weight_decay", 0.0))
 
     def act(self, obs):
         if self.policy.is_recurrent:
@@ -168,16 +190,6 @@ class PPO:
         self.policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
-        # TODO: warp this block into amp.get_amp_reward
-        if self.amp:
-            # Extract amp state and update normalization
-            amp_state = self.amp.extract_state_from_obs(obs)
-            self.amp.update_normalization(amp_state)
-            # Compute AMP reward and add to extrinsic reward
-            with torch.inference_mode():
-                amp_reward = self.amp.compute_reward(amp_state)
-            extras['log']['amp'] = amp_reward.mean().detach()
-            rewards += amp_reward
 
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
@@ -190,6 +202,30 @@ class PPO:
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
+            
+        # AMP intrinsic reward (if configured)
+        if self.amp:
+            # Extract amp state and update normalization
+            amp_state = self.amp.extract_state_from_obs(obs)
+            self.amp.update_normalization(amp_state)
+            # Compute AMP reward and add to extrinsic reward
+            self.amp_reward = self.amp.compute_reward(amp_state)
+            self.transition.rewards += self.amp_reward
+            if "episode" not in extras:
+                extras["episode"] = {}
+            extras["episode"]["amp"] = self.amp_reward
+
+        # ADD intrinsic reward (if configured)
+        if self.add:
+            # Extract add_state (expected to be demo-agent difference computed by the env) and update normalization
+            add_state = self.add.extract_state_from_obs(obs)
+            self.add.update_normalization(add_state)
+            # Compute ADD reward and add to extrinsic reward
+            self.add_reward = self.add.compute_reward(add_state)
+            self.transition.rewards += self.add_reward
+            if "episode" not in extras:
+                extras["episode"] = {}
+            extras["episode"]["add"] = self.add_reward
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -233,6 +269,16 @@ class PPO:
             mean_amp_grad_penalty = 0.0
         else:
             mean_amp_loss = None
+        # -- ADD loss (NEW)
+        if self.add:
+            mean_add_loss = 0.0
+            mean_add_pos_acc = 0.0
+            mean_add_neg_acc = 0.0
+            mean_add_pos_logit = 0.0
+            mean_add_neg_logit = 0.0
+            mean_add_grad_penalty = 0.0
+        else:
+            mean_add_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -371,6 +417,13 @@ class PPO:
                 amp_state_batch = self.amp.extract_state_from_obs(amp_obs)
                 amp_loss_dict = self.amp.compute_loss(amp_state_batch)
 
+            # ADD discriminator loss (NEW)
+            if self.add:
+                # Extract add-state from the original (non-augmented) observations
+                add_obs = obs_batch[:original_batch_size]
+                add_state_batch = self.add.extract_state_from_obs(add_obs)
+                add_loss_dict = self.add.compute_loss(add_state_batch)
+
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
@@ -382,8 +435,15 @@ class PPO:
 
             # -- For AMP: backward discriminator
             if self.amp:
+                assert "amp_loss" in amp_loss_dict
                 self.amp_optimizer.zero_grad()
                 amp_loss_dict["amp_loss"].backward()
+
+            # -- For ADD: backward discriminator
+            if self.add:
+                assert "add_loss" in add_loss_dict
+                self.add_optimizer.zero_grad()
+                add_loss_dict["add_loss"].backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -400,6 +460,10 @@ class PPO:
             if self.amp_optimizer:
                 nn.utils.clip_grad_norm_(self.amp.parameters(), self.max_grad_norm)
                 self.amp_optimizer.step()
+            # -- For ADD
+            if self.add_optimizer:
+                nn.utils.clip_grad_norm_(self.add.parameters(), self.max_grad_norm)
+                self.add_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -417,6 +481,14 @@ class PPO:
                 mean_amp_agent_logit += amp_loss_dict["amp_agent_logit"].item()
                 mean_amp_demo_logit += amp_loss_dict["amp_demo_logit"].item()
                 mean_amp_grad_penalty += amp_loss_dict["amp_grad_penalty"].item()
+            # -- ADD loss stats
+            if self.add:
+                mean_add_loss += add_loss_dict["add_loss"].item()
+                mean_add_pos_acc += add_loss_dict["add_pos_acc"].item()
+                mean_add_neg_acc += add_loss_dict["add_neg_acc"].item()
+                mean_add_pos_logit += add_loss_dict["add_pos_logit"].item()
+                mean_add_neg_logit += add_loss_dict["add_neg_logit"].item()
+                mean_add_grad_penalty += add_loss_dict["add_grad_penalty"].item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -437,6 +509,14 @@ class PPO:
             mean_amp_agent_logit /= num_updates
             mean_amp_demo_logit /= num_updates
             mean_amp_grad_penalty /= num_updates
+        # -- For ADD
+        if self.add:
+            mean_add_loss /= num_updates
+            mean_add_pos_acc /= num_updates
+            mean_add_neg_acc /= num_updates
+            mean_add_pos_logit /= num_updates
+            mean_add_neg_logit /= num_updates
+            mean_add_grad_penalty /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -461,6 +541,17 @@ class PPO:
                     "amp_grad_penalty": mean_amp_grad_penalty,
                 }
             )
+        if self.add:
+            loss_dict.update(
+                {
+                    "add": mean_add_loss,
+                    "add_pos_acc": mean_add_pos_acc,
+                    "add_neg_acc": mean_add_neg_acc,
+                    "add_pos_logit": mean_add_pos_logit,
+                    "add_neg_logit": mean_add_neg_logit,
+                    "add_grad_penalty": mean_add_grad_penalty,
+                }
+            )
 
         return loss_dict
 
@@ -477,6 +568,9 @@ class PPO:
         # NEW: broadcast AMP discriminator parameters
         if self.amp:
             model_params.append(self.amp.state_dict())
+        # NEW: broadcast ADD discriminator parameters
+        if self.add:
+            model_params.append(self.add.state_dict())
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
@@ -487,6 +581,9 @@ class PPO:
             idx += 1
         if self.amp:
             self.amp.load_state_dict(model_params[idx])
+            idx += 1
+        if self.add:
+            self.add.load_state_dict(model_params[idx])
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
@@ -500,6 +597,9 @@ class PPO:
         # NEW: include AMP discriminator grads
         if self.amp:
             grads += [param.grad.view(-1) for param in self.amp.parameters() if param.grad is not None]
+        # NEW: include ADD discriminator grads
+        if self.add:
+            grads += [param.grad.view(-1) for param in self.add.parameters() if param.grad is not None]
         if len(grads) == 0:
             return
         all_grads = torch.cat(grads)
@@ -514,6 +614,8 @@ class PPO:
             all_params = chain(all_params, self.rnd.parameters())
         if self.amp:
             all_params = chain(all_params, self.amp.parameters())
+        if self.add:
+            all_params = chain(all_params, self.add.parameters())
 
         # Update the gradients for all parameters with the reduced gradients
         offset = 0

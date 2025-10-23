@@ -18,15 +18,16 @@ class ObservationManager(ManagerBase):
     self.cfg = cfg
 
     self._group_obs_dim: dict[str, tuple[int, ...] | list[tuple[int, ...]]] = dict()
-    # Sliding window instances (per group -> per term)
+    # Sliding window instances (per group -> per term) for ONLINE (env.num_envs)
     self._sliding_windows: dict[str, dict[str, SlidingWindow]] = {}
     # Map of per-term output dims (post-aggregation) and raw dims (pre-aggregation)
     self._group_obs_term_raw_dim: dict[str, list[tuple[int, ...]]] = {}
 
-    # NEW: flags for offline computation
-    self._temp_disable_noise: bool = False
+    # Lightweight offline state toggles (no second window tree)
     self._in_offline: bool = False
+    self._temp_disable_noise: bool = False
     self._offline_excluded_terms: set[str] = set()
+    self._offline_batch_n: int = 1  # advisory; real batch inferred from obs_raw when available
 
     super().__init__(env=env)
     
@@ -57,7 +58,7 @@ class ObservationManager(ManagerBase):
 
     self._obs_buffer: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None
 
-    # Initialize sliding windows (only for enabled terms), using RAW dims (pre-aggregation)
+    # Initialize ONLINE sliding windows (only for enabled terms), using RAW dims (pre-aggregation)
     self._sliding_windows = {g: {} for g in self._group_obs_term_names.keys()}
     for group_name in self._group_obs_term_names.keys():
       for idx, (term_name, term_cfg) in enumerate(
@@ -96,10 +97,6 @@ class ObservationManager(ManagerBase):
       msg += table.get_string()
       msg += "\n"
     return msg
-
-  # NEW: configure knob for offline-excluded terms
-  def set_offline_excluded_terms(self, terms: Sequence[str]) -> None:
-    self._offline_excluded_terms = set(terms)
 
   def get_active_iterable_terms(
     self, env_idx: int
@@ -170,59 +167,67 @@ class ObservationManager(ManagerBase):
     self._obs_buffer = obs_buffer
     return obs_buffer
 
-  # NEW: transparent offline computation using scene aliasing
+  # -------- Lean offline path: swap window tree + alias, then restore --------
+  def set_offline_excluded_terms(self, terms: Sequence[str]) -> None:
+    self._offline_excluded_terms = set(terms)
+
   def compute_on_record(
     self,
     record_entity_name: str,
     *,
     logical_target_name: str = "robot",
-    reset_windows: bool = False,
     disable_noise: bool = True,
     exclude_terms: Sequence[str] | None = None,
+    offline_batch_n: int = 1,  # advisory; real batch inferred from obs_raw
   ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
-    """Compute observations while transparently redirecting 'logical_target_name' to 'record_entity_name'.
+    """Compute observations while redirecting 'logical_target_name' to 'record_entity_name'.
 
-    - Observation functions and params are unchanged.
-    - Sliding windows can be reset at the start of a clip to avoid history leakage.
-    - Noise/corruption can be disabled for deterministic offline features.
-    - Terms listed in exclude_terms (or preconfigured via set_offline_excluded_terms) are zero-filled to preserve shapes.
-
-    Returns shape-identical dict to compute().
+    Lean approach:
+      - Temporarily swap self._sliding_windows with a fresh tree (per group dict) to avoid mixing with online history.
+      - Lazily create windows sized to current obs_raw batch (typically 1) inside compute_group.
+      - Disable noise and zero-fill excluded terms for offline only.
+      - Restore original windows/state after compute().
     """
-    if reset_windows:
-      for group_windows in self._sliding_windows.values():
-        for win in group_windows.values():
-          win.reset(env_ids=None)
+    # Snapshot originals
+    orig_windows = self._sliding_windows
+    orig_in_offline = self._in_offline
+    orig_disable_noise = self._temp_disable_noise
+    orig_excluded = self._offline_excluded_terms
+    orig_batch = self._offline_batch_n
 
-    original_disable_noise = self._temp_disable_noise
-    original_in_offline = self._in_offline
-    original_excluded = self._offline_excluded_terms.copy()
+    # Install fresh window tree for offline (empty -> implies reset)
+    self._sliding_windows = {g: {} for g in self._group_obs_term_names.keys()}
+    if exclude_terms is not None:
+      self._offline_excluded_terms = set(exclude_terms)
+    self._temp_disable_noise = bool(disable_noise)
+    self._offline_batch_n = int(offline_batch_n)
+    self._in_offline = True
+
     try:
-      self._temp_disable_noise = bool(disable_noise)
-      self._in_offline = True
-      if exclude_terms is not None:
-        self._offline_excluded_terms = set(exclude_terms)
       with self._env.scene.alias({logical_target_name: record_entity_name}):
         return self.compute()
     finally:
-      self._temp_disable_noise = original_disable_noise
-      self._in_offline = original_in_offline
-      self._offline_excluded_terms = original_excluded
+      # Restore originals
+      self._sliding_windows = orig_windows
+      self._in_offline = orig_in_offline
+      self._temp_disable_noise = orig_disable_noise
+      self._offline_excluded_terms = orig_excluded
+      self._offline_batch_n = orig_batch
 
   def compute_group(self, group_name: str) -> torch.Tensor | dict[str, torch.Tensor]:
     group_term_names = self._group_obs_term_names[group_name]
     group_obs: dict[str, torch.Tensor] = {}
-    obs_terms = zip(
-      group_term_names, self._group_obs_term_cfgs[group_name], strict=False
-    )
-    for term_name, term_cfg in obs_terms:
-      # Offline exclusion: produce zeros with correct shape (post-aggregation) and skip computation
+
+    for idx, (term_name, term_cfg) in enumerate(
+      zip(group_term_names, self._group_obs_term_cfgs[group_name], strict=False)
+    ):
+      # Offline exclusion: zero-fill with correct batch size inferred from already built terms (fallback to advisory)
       if self._in_offline and term_name in self._offline_excluded_terms:
-        out_dims = self._group_obs_term_dim[group_name][
-          self._group_obs_term_names[group_name].index(term_name)
-        ]
+        out_dims = self._group_obs_term_dim[group_name][idx]
+        # Infer batch size from any already computed term in this group; else fallback to 1/advisory
+        inferred_bn = next((v.shape[0] for v in group_obs.values()), self._offline_batch_n or 1)
         zeros = torch.zeros(
-          (self._env.num_envs, *out_dims),
+          (inferred_bn, *out_dims),
           device=torch.device(self._env.device),
           dtype=torch.float32,
         )
@@ -230,12 +235,23 @@ class ObservationManager(ManagerBase):
         continue
 
       # 1) Compute raw per-step observation from source function.
-      # Always pass params at runtime (per request).
       obs_raw: torch.Tensor = term_cfg.func(self._env, **term_cfg.params).clone()
 
-      # 2) If sliding window enabled, push raw sample and optionally aggregate via hist_func.
-      sw = self._sliding_windows[group_name].get(term_name, None)
-      if sw is not None:
+      # 2) Sliding window (lazy create for current window tree)
+      if term_cfg.hist_window_size > 0:
+        # Create or get window for this term in the CURRENT window tree (online or offline)
+        gw = self._sliding_windows[group_name]
+        if term_name not in gw:
+          raw_feat_shape = torch.Size(self._group_obs_term_raw_dim[group_name][idx])
+          # Use obs_raw batch to size the window; offline demos typically have batch=1
+          batch_n = int(obs_raw.shape[0])
+          gw[term_name] = SlidingWindow(
+            num_envs=batch_n,
+            feature_shape=raw_feat_shape,
+            max_window_size=term_cfg.hist_window_size,
+            device=torch.device(self._env.device),
+          )
+        sw = gw[term_name]
         sw.push(obs_raw)
         if term_cfg.hist_func is not None:
           obs = term_cfg.hist_func(self._env, sw, **term_cfg.params)
@@ -291,6 +307,7 @@ class ObservationManager(ManagerBase):
       group = groups_with_term[0]
     assert group in self._group_obs_term_names, f"Unknown group '{group}'"
     assert term_name in self._group_obs_term_names[group], f"Unknown term '{term_name}' in group '{group}'"
+    # Returns the currently active window tree (online or offline temporary)
     return self._sliding_windows.get(group, {}).get(term_name, None)
 
   def _prepare_terms(self) -> None:
@@ -345,8 +362,6 @@ class ObservationManager(ManagerBase):
         self._group_obs_term_raw_dim[group_name].append(raw_dims)
 
         # 2) Infer OUTPUT dims:
-        #    If hist_func present and hist_window_size>0, pre-fill a temp SlidingWindow with raw samples
-        #    (using same params) then call hist_func(env, temp_sw, **params) to get output shape.
         if term_cfg.hist_func is not None and term_cfg.hist_window_size > 0:
           temp_sw = SlidingWindow(
             num_envs=self._env.num_envs,

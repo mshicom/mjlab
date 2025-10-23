@@ -7,32 +7,26 @@ from mjlab.tasks.velocity.rl.exporter import (
   attach_onnx_metadata,
   export_velocity_policy_as_onnx,
 )
-from mjlab.utils.dataset.motion_dataset import prepare_amp_demo
-
+from mjlab.tasks.velocity.mdp import AMPDemoProvider
+from dataclasses import asdict
 
 class VelocityOnPolicyRunner(OnPolicyRunner):
   env: RslRlVecEnvWrapper
   def __init__(self, env: RslRlVecEnvWrapper, train_cfg: dict, log_dir: str | None = None, device="cpu"):
     
-    # TODO: make prepare_amp_demo and env.unwrapped.sample_amp_demos stuff in a env wrapper
-    # Prepare AMP demo dataset (if configured) before constructing OnPolicyRunner.
+    # Prepare AMP demo provider (if configured) before constructing OnPolicyRunner.
     # This ensures env.sample_amp_demos exists when rsl_rl resolves AMP config.
-    amp_ds_cfg = getattr(env.cfg, "amp_dataset", None)
-    if amp_ds_cfg is not None and amp_ds_cfg.enabled:
-      # build or reuse cached per-trajectory features and attach env.unwrapped.sample_amp_demos
-      _ = prepare_amp_demo(
-        env=env.unwrapped,  # use underlying mjlab env to access sim + observation_manager
-        trajectories=amp_ds_cfg.trajectories,
-        group_name=amp_ds_cfg.group_name,
-        subsample_stride=amp_ds_cfg.subsample_stride,
-        max_frames_per_traj=amp_ds_cfg.max_frames_per_traj,
-        seed=amp_ds_cfg.seed
-      )
+    amp_demo_cfg = getattr(env.cfg, "amp_demo", None)
+    if amp_demo_cfg is not None and amp_demo_cfg.enabled:
+      cfg = asdict(amp_demo_cfg)
+      cfg.pop("enabled")
+      provider = AMPDemoProvider(env.unwrapped, **cfg)
+      provider.build()
+      env.unwrapped.sample_amp_demos = provider
       train_cfg["algorithm"]["amp_cfg"]['enabled'] = True
 
     # Proceed with standard rsl_rl on-policy runner initialization
     super().__init__(env, train_cfg, log_dir, device)
-    
 
   def save(self, path: str, infos=None):
     """Save the model and training information."""

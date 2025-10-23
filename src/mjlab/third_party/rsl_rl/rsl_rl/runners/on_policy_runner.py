@@ -1,6 +1,4 @@
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
-# All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
@@ -16,8 +14,9 @@ import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
-# NEW: AMP resolver
+# NEW: AMP & ADD resolvers
 from rsl_rl.modules.amp import resolve_amp_config
+from rsl_rl.modules.add import resolve_add_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 
@@ -43,8 +42,10 @@ class OnPolicyRunner:
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
-        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"]["enabled"]:
-            default_sets.append("amp_state")
+        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"].get("enabled", False):
+            default_sets.append(self.alg_cfg["amp_cfg"].get("obs_key", "amp_state"))
+        if "add_cfg" in self.alg_cfg and self.alg_cfg["add_cfg"].get("enabled", False):
+            default_sets.append(self.alg_cfg["add_cfg"].get("obs_key", "add_state"))
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
 
         # create the algorithm
@@ -126,6 +127,12 @@ class OnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        
+                        if self.alg.amp:
+                            cur_reward_sum += self.alg.amp_reward
+                        if self.alg.add:
+                            cur_reward_sum += self.alg.add_reward
+                            
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -306,6 +313,10 @@ class OnPolicyRunner:
         if hasattr(self.alg, "amp") and self.alg.amp:
             saved_dict["amp_state_dict"] = self.alg.amp.state_dict()
             saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
+        # -- Save ADD discriminator if used (NEW)
+        if hasattr(self.alg, "add") and self.alg.add:
+            saved_dict["add_state_dict"] = self.alg.add.state_dict()
+            saved_dict["add_optimizer_state_dict"] = self.alg.add_optimizer.state_dict()
         torch.save(saved_dict, path)
 
         # upload model to external logging service
@@ -316,22 +327,34 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        # -- Load RND model if used
-        if hasattr(self.alg, "rnd") and self.alg.rnd:
-            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-        # -- Load AMP discriminator if used (NEW)
-        if hasattr(self.alg, "amp") and self.alg.amp:
-            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+        try:
+            # -- Load RND model if used
+            if hasattr(self.alg, "rnd") and self.alg.rnd:
+                self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+            # -- Load AMP discriminator if used (NEW)
+            if hasattr(self.alg, "amp") and self.alg.amp:
+                self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+            # -- Load ADD discriminator if used (NEW)
+            if hasattr(self.alg, "add") and self.alg.add:
+                self.alg.add.load_state_dict(loaded_dict["add_state_dict"])
+        except KeyError:
+            pass
         # -- load optimizer if used
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            # -- RND optimizer if used
-            if hasattr(self.alg, "rnd") and self.alg.rnd:
-                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-            # -- AMP optimizer if used
-            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer:
-                self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+            try:
+                # -- RND optimizer if used
+                if hasattr(self.alg, "rnd") and self.alg.rnd:
+                    self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+                # -- AMP optimizer if used
+                if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer:
+                    self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+                # -- ADD optimizer if used
+                if hasattr(self.alg, "add_optimizer") and self.alg.add_optimizer:
+                    self.alg.add_optimizer.load_state_dict(loaded_dict["add_optimizer_state_dict"])
+            except KeyError:
+                pass
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
@@ -352,6 +375,9 @@ class OnPolicyRunner:
         # -- AMP
         if hasattr(self.alg, "amp") and self.alg.amp:
             self.alg.amp.train()
+        # -- ADD
+        if hasattr(self.alg, "add") and self.alg.add:
+            self.alg.add.train()
 
     def eval_mode(self):
         # -- PPO
@@ -362,6 +388,9 @@ class OnPolicyRunner:
         # -- AMP
         if hasattr(self.alg, "amp") and self.alg.amp:
             self.alg.amp.eval()
+        # -- ADD
+        if hasattr(self.alg, "add") and self.alg.add:
+            self.alg.add.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
@@ -424,6 +453,8 @@ class OnPolicyRunner:
 
         # resolve AMP configuration (validate obs key, set demo_provider if env provides it)
         self.alg_cfg = resolve_amp_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
+        # resolve ADD configuration (validate obs key)
+        self.alg_cfg = resolve_add_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
         
         # resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:

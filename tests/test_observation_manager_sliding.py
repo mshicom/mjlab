@@ -618,10 +618,10 @@ def test_offline_parity_with_alias_and_exclusion(tmp_path: Path, device: str):
         last_action: ObservationTermCfg | None = None
 
     @dataclass
-    class ChainCfg:
+    class ObsCfg:
         g: ObsGroupCfg
 
-    cfg = ChainCfg(
+    cfg = ObsCfg(
         g=ObsGroupCfg(
             concatenate_terms=False,
             concatenate_dim=-1,

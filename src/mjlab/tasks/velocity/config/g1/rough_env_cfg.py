@@ -9,6 +9,9 @@ from mjlab.tasks.velocity.velocity_env_cfg import (
 )
 from mjlab.utils.spec_config import ContactSensorCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.dataclasses import get_terms
+from mjlab.managers.manager_term_config import RewardTermCfg
+from mjlab.scene import RecordCfg
 
 @dataclass
 class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
@@ -72,18 +75,20 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.terminations.root_height_below_minimum.params["minimum_height"] = 0.4
 
     # AMP observation term
-    self.amp_dataset.enabled = True
-    self.amp_dataset.trajectories = [
-      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onestepleft.npz",
-      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onestepright.npz",
-      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onesteplong.npz",
-      "/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/walk.npz",
+    self.amp_demo.enabled = True
+    self.scene.records = [
+      RecordCfg(
+        path="/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz",
+        source_xml="/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml"
+      ),
     ]
-    # self.observations.discriminator.qpos.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=[
-    #   ".*_hip_.*",
-    #   ".*knee_.*",
-    #   ".*ankle_pitch.*",
-    # ]), 
+    
+    # disable all other rewards for pure amp test
+    if 1:
+      cfg_items = get_terms(self.rewards, RewardTermCfg).items()
+      for term_name, term_cfg in cfg_items:
+          term_cfg.weight = 0.
+
     
 
 

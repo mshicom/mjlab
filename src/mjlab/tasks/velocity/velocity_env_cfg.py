@@ -16,16 +16,14 @@ from mjlab.managers.manager_term_config import RewardTermCfg as RewardTerm
 from mjlab.managers.manager_term_config import TerminationTermCfg as DoneTerm
 from mjlab.managers.manager_term_config import term
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.scene import SceneCfg
+from mjlab.scene import SceneCfg, RecordCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.velocity import mdp
 from mjlab.terrains import TerrainImporterCfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
-
-from mjlab.utils.dataset.motion_dataset import TrajectorySpec, AmpDatasetCfg
-from typing import List, Optional
+from mjlab.tasks.velocity.mdp import AMDDemoCfg
 
 from mjlab.managers.manager_term_config import term, ObservationTermCfg as ObsTerm, EventTermCfg as EventTerm
 from mjlab.rl.config import RslRlPpoAmpCfg
@@ -37,6 +35,7 @@ SCENE_CFG = SceneCfg(
   ),
   num_envs=1,
   extent=2.0,
+  records=[],
 )
 
 VIEWER_CONFIG = ViewerConfig(
@@ -147,12 +146,26 @@ class ObservationCfg:
       hist_func=mdp.aggregate_cat,
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=[
-          r".*hip.*",
-          r".*knee.*",
-          r".*ankle.*",
+          r".*",
+          # r".*hip.*",
+          # r".*knee.*",
+          # r".*ankle.*",
         ]),   # can be overrided in robot cfg.
       }
-      # No noise/corruption to keep clean demos
+    )
+    
+    base_lin_vel_hist: ObsTerm = term(
+      ObsTerm,
+      func=mdp.base_lin_vel,
+      hist_window_size=2,
+      hist_func=mdp.aggregate_cat,
+    )
+    
+    base_ang_vel_hist: ObsTerm = term(
+      ObsTerm,
+      func=mdp.base_ang_vel,
+      hist_window_size=2,
+      hist_func=mdp.aggregate_cat,
     )
 
     def __post_init__(self):
@@ -209,11 +222,11 @@ class EventCfg:
 
 @dataclass
 class RewardCfg:
-  is_alive: RewardTerm = term(
-    RewardTerm, 
-    func=mdp.is_alive, 
-    weight=1.0
-  )
+  # is_alive: RewardTerm = term(
+  #   RewardTerm, 
+  #   func=mdp.is_alive, 
+  #   weight=1.0
+  # )
   
   track_lin_vel_exp: RewardTerm = term(
     RewardTerm,
@@ -304,7 +317,16 @@ SIM_CFG = SimulationCfg(
   ),
 )
 
-AMP_CFG = AmpDatasetCfg()
+AMP_CFG = AMDDemoCfg(
+  enabled=False,
+  obs_key="amp_state",
+  logical_target_name="robot",
+  exclude_terms=["actions", "command", "joint_state_history", "joint_vel", "joint_pos", "projected_gravity"],
+  use_cache=True,
+  cache_dir=None,
+  cache_filename=None,
+  prefer_cuda=True,
+)
 
 @dataclass
 class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
@@ -320,9 +342,17 @@ class LocomotionVelocityEnvCfg(ManagerBasedRlEnvCfg):
   viewer: ViewerConfig = field(default_factory=lambda: VIEWER_CONFIG)
   decimation: int = 4  # 50 Hz control frequency.
   episode_length_s: float = 20.0
-  amp_dataset: AmpDatasetCfg = field(default_factory=lambda: AMP_CFG)
+  amp_demo: AMDDemoCfg = field(default_factory=lambda: AMP_CFG)
 
   def __post_init__(self):
     if self.scene.terrain is not None:
       if self.scene.terrain.terrain_generator is not None:
         self.scene.terrain.terrain_generator.curriculum = True
+    
+    if len(SCENE_CFG.records) == 0:
+      self.amp_demo.enabled = False
+    
+    if self.amp_demo.enabled:
+      # check if obs_key in observations
+      if not hasattr(self.observations, self.amp_demo.obs_key):
+        raise ValueError(f"AMP obs_key '{self.amp_demo.obs_key}' not found in observations.")

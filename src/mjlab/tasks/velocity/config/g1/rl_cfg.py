@@ -37,20 +37,21 @@ class UnitreeG1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
       amp_cfg=RslRlPpoAmpCfg(
         enabled=False,
         obs_key="amp_state",
+        demo_batch_ratio=0.1,
+        reward_scale=1.0,
+        disc_loss_coef=5.0,
         hidden_dims=(1024, 256),
         activation="relu",
-        init_output_scale=1.0,
         learning_rate=5e-5,
-        opt_weight_decay=0,
         logit_reg=0.01,
         grad_penalty=1.0,
         disc_weight_decay=0.0001,
-        reward_scale=1.0,
-        eval_batch_size=0,
-        norm_until=None,
         # demo_provider=resolved automatically from env.sample_amp_demos if present
-        demo_batch_ratio=0.1
+        norm_until=None,
+        eval_batch_size=0,
+        init_output_scale=1.0,
       )
+      
     )
   )
   experiment_name: str = "g1_velocity"

@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from rsl_rl.networks.normalization import EmpiricalNormalization
-
+from functools import cache
 
 @dataclass
 class AMPConfig:
@@ -52,12 +52,8 @@ class AMPConfig:
 
     learning_rate: float = 5e-5
     '''Discriminator optimizer learning rate. Uses Adam optimizer.'''
-
-    opt_weight_decay: float = 0.0
-    '''Weight decay for the optimizer (Adam). This is separate from "disc_weight_decay" below.
-    The latter adds an explicit L2 penalty term to the loss, matching MimicKit.'''
     
-    amp_loss_weight: float = 5.0
+    disc_loss_coef: float = 5.0
 
     logit_reg: float = 0.01
     '''Coefficient for L2 penalty on the final logit layer weights ||W_logit||^2.'''
@@ -153,26 +149,15 @@ class AMPDiscriminator(nn.Module):
         if amp_cfg.init_output_scale != 0.0:
             nn.init.uniform_(self.logits.weight, -amp_cfg.init_output_scale, amp_cfg.init_output_scale)
             nn.init.zeros_(self.logits.bias)
+        self.bce = nn.BCEWithLogitsLoss()
 
-    # -------------------------------
-    # Utilities: weight collections
-    # -------------------------------
+
+    @cache
     def get_logit_weights(self) -> torch.Tensor:
         """Return flattened weights of the final logit layer for L2 regularization."""
         return self.logits.weight.view(-1)
+    
 
-    def get_all_weights(self) -> torch.Tensor:
-        """Concatenate flattened weights across all linear layers (including logits)."""
-        flat_ws = []
-        for m in self.backbone.modules():
-            if isinstance(m, nn.Linear):
-                flat_ws.append(m.weight.view(-1))
-        flat_ws.append(self.logits.weight.view(-1))
-        return torch.cat(flat_ws) if flat_ws else torch.zeros(1, device=self.device)
-
-    # -------------------------------
-    # Forward and reward
-    # -------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute discriminator logits.
 
@@ -186,8 +171,7 @@ class AMPDiscriminator(nn.Module):
         h = self.backbone(x)
         return self.logits(h).squeeze(-1)
 
-    @torch.no_grad()
-    def compute_reward(self, amp_state: torch.Tensor) -> torch.Tensor:
+    def compute_reward(self, amp_state: torch.Tensor,*, detach: bool = True) -> torch.Tensor:
         """Compute AMP reward for given raw amp_state batch.
 
         reward = -log(max(1 - sigmoid(logit), 1e-4)) * reward_scale.
@@ -196,33 +180,33 @@ class AMPDiscriminator(nn.Module):
           - Uses EmpiricalNormalization for inputs (normalizer parameters are updated elsewhere).
           - Mirrors MimicKit's _calc_disc_rewards exactly (including clamp 1e-4 epsilon).
         """
-        # Normalize inputs
-        x = self.state_norm(amp_state)
-        # Optionally chunk to reduce memory
-        if self.cfg.eval_batch_size and self.cfg.eval_batch_size > 0 and x.shape[0] > self.cfg.eval_batch_size:
-            rewards = []
-            bs = self.cfg.eval_batch_size
-            for i in range(0, x.shape[0], bs):
-                logits = self.forward(x[i : i + bs])
-                prob = torch.sigmoid(logits)
-                r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))
-                rewards.append(r * self.cfg.reward_scale)
-            return torch.cat(rewards, dim=0)
-        else:
+        with torch.set_grad_enabled(not detach):
+            # Normalize inputs
+            x = self.state_norm(amp_state)
+            # Optionally chunk to reduce memory
+            if self.cfg.eval_batch_size and self.cfg.eval_batch_size > 0 and x.shape[0] > self.cfg.eval_batch_size:
+                rewards = []
+                bs = self.cfg.eval_batch_size
+                for i in range(0, x.shape[0], bs):
+                    logits = self.forward(x[i : i + bs])
+                    prob = torch.sigmoid(logits)
+                    r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))
+                    rewards.append(r * self.cfg.reward_scale)
+                return torch.cat(rewards, dim=0)
+            
+            # process all at once
             logits = self.forward(x)
             prob = torch.sigmoid(logits)
             r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))
-            return r * self.cfg.reward_scale
+            r = r * self.cfg.reward_scale
+            return r
 
     @torch.no_grad()
     def update_normalization(self, amp_state: torch.Tensor):
         """Update empirical normalization with a batch of raw amp_state."""
-        # EmpiricalNormalization.update() safely no-ops in eval mode or if until reached.
         self.state_norm.update(amp_state)
 
-    # -------------------------------
-    # Loss
-    # -------------------------------
+
     def compute_loss(self, agent_state: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute discriminator losses using agent vs. demo batches.
 
@@ -231,7 +215,7 @@ class AMPDiscriminator(nn.Module):
           - Average the two losses.
           - Add L2 penalty on final logit weights (logit_reg).
           - Add gradient penalty on demo inputs grad_penalty * E[||∂D/∂x_demo||^2].
-          - Add manual weight decay disc_weight_decay * Σ||W||^2 across all Linear weights.
+          - Add weight decay disc_weight_decay * Σ||W||^2 across all Linear weights (by optimizer)
 
         Additionally:
           - Updates normalization statistics for both agent and demo inputs before evaluating loss, as in MimicKit
@@ -252,53 +236,44 @@ class AMPDiscriminator(nn.Module):
         # Normalize inputs
         agent_norm = self.state_norm(agent_state)
         demo_norm = self.state_norm(demo_state)
-        # Enable grad on demo inputs for gradient penalty
-        if self.cfg.grad_penalty != 0.0:
-            demo_norm.requires_grad_(True)
+        demo_norm.requires_grad_(True)
 
         # Logits
         agent_logit = self.forward(agent_norm)
         demo_logit = self.forward(demo_norm)
 
         # BCEWithLogits losses
-        bce = nn.BCEWithLogitsLoss()
-        loss_agent = bce(agent_logit, torch.zeros_like(agent_logit))
-        loss_demo = bce(demo_logit, torch.ones_like(demo_logit))
+        loss_agent = self.bce(agent_logit, torch.zeros_like(agent_logit))
+        loss_demo  = self.bce(demo_logit,  torch.ones_like(demo_logit))
         loss = 0.5 * (loss_agent + loss_demo)
 
         # Logit weight L2 regularization
-        if self.cfg.logit_reg != 0.0:
-            loss += self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
+        loss += self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
 
         # Gradient penalty on demo inputs: E[||∂D/∂x_demo||^2]
-        grad_penalty = torch.tensor(0.0, device=device)
-        if self.cfg.grad_penalty != 0.0:
-            grad = torch.autograd.grad(
-                demo_logit,
-                demo_norm,
-                grad_outputs=torch.ones_like(demo_logit),
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-            # Sum of squared grads over feature dimension, mean over batch
-            grad_sq = torch.sum(grad * grad, dim=-1)
-            grad_penalty = torch.mean(grad_sq)
-            loss += self.cfg.grad_penalty * grad_penalty
+        grad = torch.autograd.grad(
+            demo_logit,
+            demo_norm,
+            grad_outputs=torch.ones_like(demo_logit),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        # Sum of squared grads over feature dimension, mean over batch
+        grad_sq = torch.sum(grad * grad, dim=-1)
+        grad_penalty = torch.mean(grad_sq)
+        loss += self.cfg.grad_penalty * grad_penalty
 
-        # Manual discriminator weight decay over all layer weights (separate from optimizer)
-        if self.cfg.disc_weight_decay != 0.0:
-            all_w = self.get_all_weights()
-            loss += self.cfg.disc_weight_decay * torch.sum(all_w * all_w)
-
-        loss *= self.cfg.amp_loss_weight
+        # overall scaling
+        loss *= self.cfg.disc_loss_coef
+        
         # Accuracy metrics (fraction correct)
         agent_acc = (agent_logit < 0.0).float().mean()
-        demo_acc = (demo_logit > 0.0).float().mean()
+        demo_acc  = (demo_logit > 0.0).float().mean()
 
         # Means of logits (for diagnostics)
         agent_logit_mean = agent_logit.mean()
-        demo_logit_mean = demo_logit.mean()
+        demo_logit_mean  = demo_logit.mean()
 
         return {
             "amp_loss": loss,
@@ -311,9 +286,7 @@ class AMPDiscriminator(nn.Module):
             "amp_demo_logit": demo_logit_mean.detach(),
         }
 
-    # -------------------------------
-    # Observation extraction
-    # -------------------------------
+
     def extract_state_from_obs(self, obs: object) -> torch.Tensor:
         """Extract the AMP state from an observations container by key.
 
