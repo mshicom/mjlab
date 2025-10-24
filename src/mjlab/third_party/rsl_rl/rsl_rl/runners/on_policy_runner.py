@@ -159,6 +159,14 @@ class OnPolicyRunner:
             # update policy
             loss_dict = self.alg.update()
 
+            # transfer amp/add info from loss_dict to ep_infos for logging
+            if self.alg.amp: 
+                ep_infos.append({'amp_agent_logit': loss_dict.pop('amp_agent_logit')})
+                ep_infos.append({'amp_demo_logit': loss_dict.pop('amp_demo_logit')})
+            if self.alg.add:
+                ep_infos.append({'add_pos_logit': loss_dict.pop('add_pos_logit')})
+                ep_infos.append({'add_neg_logit': loss_dict.pop('add_neg_logit')})
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -196,19 +204,19 @@ class OnPolicyRunner:
         # -- Episode info
         ep_string = ""
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
-                infotensor = torch.tensor([], device=self.device)
-                for ep_info in locs["ep_infos"]:
-                    # handle scalar and zero dimensional tensor infos
-                    if key not in ep_info:
-                        continue
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                # log to logger and terminal
+            # list of dict to dict of lists
+            infotensors = {}
+            for ep_info in locs["ep_infos"]:
+                for key, value in ep_info.items():
+                    infotensors.setdefault(key, [])
+                    value = torch.as_tensor(value) 
+                    if value.numel() > 1:   # mean over num_envs
+                        value = value.mean()
+                    infotensors[key].append(value)
+                    
+            # log to logger and terminal
+            for key, infotensor in infotensors.items():    
+                value = torch.mean(torch.stack(infotensor)).item()  # mean over episodes
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""

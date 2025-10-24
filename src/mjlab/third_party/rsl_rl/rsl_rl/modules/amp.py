@@ -197,7 +197,8 @@ class AMPDiscriminator(nn.Module):
             # process all at once
             logits = self.forward(x)
             prob = torch.sigmoid(logits)
-            r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))
+            # 以D(actor)逼近1的程度为奖励（r=小数点后几位, 1=1e-1, 2=1e-2，最大4=1e-4）
+            r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))   
             r = r * self.cfg.reward_scale
             return r
 
@@ -267,23 +268,15 @@ class AMPDiscriminator(nn.Module):
         # overall scaling
         loss *= self.cfg.disc_loss_coef
         
-        # Accuracy metrics (fraction correct)
-        agent_acc = (agent_logit < 0.0).float().mean()
-        demo_acc  = (demo_logit > 0.0).float().mean()
-
         # Means of logits (for diagnostics)
         agent_logit_mean = agent_logit.mean()
         demo_logit_mean  = demo_logit.mean()
 
         return {
             "amp_loss": loss,
-            "amp_loss_agent": loss_agent.detach(),
-            "amp_loss_demo": loss_demo.detach(),
             "amp_grad_penalty": grad_penalty.detach(),
-            "amp_agent_acc": agent_acc.detach(),
-            "amp_demo_acc": demo_acc.detach(),
-            "amp_agent_logit": agent_logit_mean.detach(),
-            "amp_demo_logit": demo_logit_mean.detach(),
+            "amp_agent_logit": agent_logit_mean.detach(),      # agent的判别输出，前期接近-1表明判别器学会了判别，后期接近1表明actor成功骗过判别器
+            "amp_demo_logit": demo_logit_mean.detach(),        # demo 的判别输出，越接近+1越好
         }
 
 

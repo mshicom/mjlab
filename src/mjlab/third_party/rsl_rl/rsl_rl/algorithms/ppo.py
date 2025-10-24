@@ -213,7 +213,7 @@ class PPO:
             self.transition.rewards += self.amp_reward
             if "episode" not in extras:
                 extras["episode"] = {}
-            extras["episode"]["amp"] = self.amp_reward
+            extras["episode"]["amp reward"] = self.amp_reward
 
         # ADD intrinsic reward (if configured)
         if self.add:
@@ -225,7 +225,7 @@ class PPO:
             self.transition.rewards += self.add_reward
             if "episode" not in extras:
                 extras["episode"] = {}
-            extras["episode"]["add"] = self.add_reward
+            extras["episode"]["add reward"] = self.add_reward
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
@@ -262,8 +262,6 @@ class PPO:
         # -- AMP loss (NEW)
         if self.amp:
             mean_amp_loss = 0.0
-            mean_amp_agent_acc = 0.0
-            mean_amp_demo_acc = 0.0
             mean_amp_agent_logit = 0.0
             mean_amp_demo_logit = 0.0
             mean_amp_grad_penalty = 0.0
@@ -272,8 +270,6 @@ class PPO:
         # -- ADD loss (NEW)
         if self.add:
             mean_add_loss = 0.0
-            mean_add_pos_acc = 0.0
-            mean_add_neg_acc = 0.0
             mean_add_pos_logit = 0.0
             mean_add_neg_logit = 0.0
             mean_add_grad_penalty = 0.0
@@ -476,16 +472,12 @@ class PPO:
             # -- AMP loss stats
             if self.amp:
                 mean_amp_loss += amp_loss_dict["amp_loss"].item()
-                mean_amp_agent_acc += amp_loss_dict["amp_agent_acc"].item()
-                mean_amp_demo_acc += amp_loss_dict["amp_demo_acc"].item()
                 mean_amp_agent_logit += amp_loss_dict["amp_agent_logit"].item()
                 mean_amp_demo_logit += amp_loss_dict["amp_demo_logit"].item()
                 mean_amp_grad_penalty += amp_loss_dict["amp_grad_penalty"].item()
             # -- ADD loss stats
             if self.add:
                 mean_add_loss += add_loss_dict["add_loss"].item()
-                mean_add_pos_acc += add_loss_dict["add_pos_acc"].item()
-                mean_add_neg_acc += add_loss_dict["add_neg_acc"].item()
                 mean_add_pos_logit += add_loss_dict["add_pos_logit"].item()
                 mean_add_neg_logit += add_loss_dict["add_neg_logit"].item()
                 mean_add_grad_penalty += add_loss_dict["add_grad_penalty"].item()
@@ -504,16 +496,12 @@ class PPO:
         # -- For AMP
         if self.amp:
             mean_amp_loss /= num_updates
-            mean_amp_agent_acc /= num_updates
-            mean_amp_demo_acc /= num_updates
             mean_amp_agent_logit /= num_updates
             mean_amp_demo_logit /= num_updates
             mean_amp_grad_penalty /= num_updates
         # -- For ADD
         if self.add:
             mean_add_loss /= num_updates
-            mean_add_pos_acc /= num_updates
-            mean_add_neg_acc /= num_updates
             mean_add_pos_logit /= num_updates
             mean_add_neg_logit /= num_updates
             mean_add_grad_penalty /= num_updates
@@ -534,8 +522,6 @@ class PPO:
             loss_dict.update(
                 {
                     "amp": mean_amp_loss,
-                    "amp_agent_acc": mean_amp_agent_acc,
-                    "amp_demo_acc": mean_amp_demo_acc,
                     "amp_agent_logit": mean_amp_agent_logit,
                     "amp_demo_logit": mean_amp_demo_logit,
                     "amp_grad_penalty": mean_amp_grad_penalty,
@@ -545,8 +531,6 @@ class PPO:
             loss_dict.update(
                 {
                     "add": mean_add_loss,
-                    "add_pos_acc": mean_add_pos_acc,
-                    "add_neg_acc": mean_add_neg_acc,
                     "add_pos_logit": mean_add_pos_logit,
                     "add_neg_logit": mean_add_neg_logit,
                     "add_grad_penalty": mean_add_grad_penalty,

@@ -284,18 +284,12 @@ class ADDDiscriminator(nn.Module):
         # scale total loss
         loss *= self.cfg.disc_loss_weight
 
-        pos_acc = (pos_logit > 0.0).float().mean()
-        neg_acc = (neg_logit < 0.0).float().mean()
         pos_logit_mean = pos_logit.mean()
         neg_logit_mean = neg_logit.mean()
 
         return {
             "add_loss": loss,
-            "add_loss_pos": loss_pos.detach(),
-            "add_loss_neg": loss_neg.detach(),
             "add_grad_penalty": grad_penalty.detach(),
-            "add_pos_acc": pos_acc.detach(),
-            "add_neg_acc": neg_acc.detach(),
             "add_pos_logit": pos_logit_mean.detach(),
             "add_neg_logit": neg_logit_mean.detach(),
         }
