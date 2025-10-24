@@ -77,6 +77,7 @@ class ManagerBasedEnv:
       mj_model=self.sim.mj_model,
       model=self.sim.model,
       data=self.sim.data,
+      env_fps=1.0/self.step_dt,
     )
 
     print_info("[INFO]: Base environment:")

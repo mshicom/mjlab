@@ -112,6 +112,7 @@ class EntityCfg:
   debug_vis: bool = False
 
 
+
 @dataclass
 class EntityArticulationInfoCfg:
   actuators: tuple[spec_cfg.ActuatorCfg, ...] = field(default_factory=tuple)
@@ -188,20 +189,18 @@ class Entity:
   | Floating Articulated      | Humanoid, quadruped        | False         | True           | True/False  |
   """
 
-  def __init__(self, cfg: EntityCfg, entity_type: EntityType = EntityType.ENV, alias_spec: mujoco.MjSpec | None = None) -> None:
+  def __init__(self, cfg: EntityCfg, entity_type: EntityType = EntityType.ENV) -> None:
     """Construct an Entity.
 
     Args:
       cfg: Entity configuration for live entities.
       entity_type: ENV for live, REC for offline record.
-
-    Notes:
-      - alias_spec is deprecated and ignored for REC entities. Use bind_target_entity().
     """
     self.cfg = cfg
     self._type = entity_type
     self._target: Entity | None = None  # NEW: target live entity for REC
     self._spec = cfg.spec_fn()
+    self._env_fps: float = 50.0  # set during initialize for ENV
 
     # Identify free joint and articulated joints (will be updated after bind for REC).
     all_joints = self._spec.joints
@@ -221,6 +220,7 @@ class Entity:
     self._rec_len: int = 0
     self._rec_frame: int = 0
     self._rec_buffer: _RecordDataBuffer | None = None
+    self._ref_fps: float | None = None
 
     # Recording state
     self._recording: bool = False
@@ -450,7 +450,10 @@ class Entity:
     model: mjwarp.Model,
     data: mjwarp.Data,
     device: str,
+    env_fps: float = 50.0,
   ) -> None:
+    self._env_fps = env_fps
+    
     # For REC, indexing/layout should reflect the bound target spec.
     indexing = self._compute_indexing(mj_model, device)
     self.indexing = indexing
@@ -668,11 +671,12 @@ class Entity:
     self._rec_arrays = adapted
     self._rec_len = adapted["qpos"].shape[0]
     self._rec_frame = 0
+    self._rec_fps = freq
 
-    # Optionally resample to requested frequency.
-    if resample_to_frequency is not None:
-      # Use the mj_model passed into load_record whenever available (preferred).
-      self.interpolate_record(resample_to_frequency, recompute_kinematics=True, mj_model=mj_model)
+    # resample to requested frequency.
+    resample_to_frequency = resample_to_frequency or self._env_fps
+    # Use the mj_model passed into load_record whenever available (preferred).
+    self.interpolate_record(resample_to_frequency, recompute_kinematics=True, mj_model=mj_model)
 
     if self._rec_buffer is not None:
       self._bind_rec_frame(0)
@@ -698,13 +702,20 @@ class Entity:
       self._bind_rec_frame(idx)
       yield idx
 
+  @property
+  def env_fps(self) -> float:
+    return self._env_fps
+  @property
+  def rec_fps(self) -> float:
+    return self._rec_fps
+
   # Recording API (split start_record + add_frame + save_record).
 
-  def start_record(self, *, frequency_hz: float | None = None) -> None:
+  def start_record(self, frequency_hz: float | None = None) -> None:
     """Begin recording frames from the current entity data.
 
     Args:
-      frequency_hz: Optional sampling frequency to embed into the saved file.
+      frequency_hz: sampling frequency to embed into the saved file, defaults to env_fps.
     """
     assert not self._recording, "Recording already started."
     self._recording = True
@@ -724,8 +735,8 @@ class Entity:
       "body_names": self.body_names,
       "site_names": self.site_names,
     }
-    if frequency_hz is not None:
-      self._record_info["frequency"] = float(frequency_hz)
+    frequency_hz = frequency_hz or self.env_fps
+    self._record_info["frequency"] = float(frequency_hz)
     # Embed compiled XML for 3rd-party tools
     self._record_mjcf_xml = self.cfg.spec_fn().to_xml()
       
@@ -831,6 +842,7 @@ class Entity:
       self._rec_len = self._rec_arrays["qpos"].shape[0]
       self._rec_frame = min(self._rec_frame, max(0, self._rec_len - 1))
       return
+    print(f"Resampling from {old_freq:.2f}Hz to {new_frequency:.2f}Hz")
     t_old = np.linspace(0.0, dur, T_old, dtype=np.float64)
     T_new = int(round(dur * new_frequency)) + 1
     T_new = max(T_new, 2)
@@ -1050,18 +1062,12 @@ class Entity:
       if self.indexing.joint_v_adr.numel() > 0:
         buf.qvel[:, self.indexing.joint_v_adr] = qvel[None, 6:]
 
-    if xpos.numel() > 0:
-      buf.xpos[:, self.indexing.body_ids] = xpos[None, :, :]
-    if xquat.numel() > 0:
-      buf.xquat[:, self.indexing.body_ids] = xquat[None, :, :]
-    if cvel.numel() > 0:
-      buf.cvel[:, self.indexing.body_ids] = cvel[None, :, :]
-    if subtree.numel() > 0:
-      buf.subtree_com[:, self.indexing.body_ids] = subtree[None, :, :]
-    if site_xpos.numel() > 0:
-      buf.site_xpos[:, self.indexing.site_ids] = site_xpos[None, :, :]
-    if site_xmat.numel() > 0:
-      buf.site_xmat[:, self.indexing.site_ids] = site_xmat[None, :, :]
+    buf.xpos[:, self.indexing.body_ids] = xpos[None, :, :]
+    buf.xquat[:, self.indexing.body_ids] = xquat[None, :, :]
+    buf.cvel[:, self.indexing.body_ids] = cvel[None, :, :]
+    buf.subtree_com[:, self.indexing.body_ids] = subtree[None, :, :]
+    buf.site_xpos[:, self.indexing.site_ids] = site_xpos[None, :, :]
+    buf.site_xmat[:, self.indexing.site_ids] = site_xmat[None, :, :]
 
   # Convenience helpers.
 

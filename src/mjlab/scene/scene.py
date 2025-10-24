@@ -155,12 +155,13 @@ class Scene:
     mj_model: mujoco.MjModel,
     model: mjwarp.Model,
     data: mjwarp.Data,
+    env_fps: float,
   ):
     self._default_env_origins = torch.zeros(
       (self._cfg.num_envs, 3), device=self._device, dtype=torch.float32
     )
     for ent in self._entities.values():
-      ent.initialize(mj_model, model, data, self._device)
+      ent.initialize(mj_model, model, data, self._device, env_fps)
 
     # Create records now that model/data are available.
     # Choose default target entity if unspecified.
@@ -177,7 +178,7 @@ class Scene:
       record.bind_target_entity(target_ent)
 
       # Initialize record entity (creates nworld=1 offline buffer)
-      record.initialize(mj_model, model, data, self._device)
+      record.initialize(mj_model, model, data, self._device, env_fps)
 
       # Load record arrays; use source_xml if provided to reconstruct _info if needed;
       # optionally resample to a desired frequency.
