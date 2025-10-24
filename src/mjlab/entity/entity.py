@@ -454,11 +454,22 @@ class Entity:
     # For REC, indexing/layout should reflect the bound target spec.
     indexing = self._compute_indexing(mj_model, device)
     self.indexing = indexing
-    nworld = data.nworld
+
+    # Determine desired batch size for this entity's data tensors.
+    nworld_sim = int(getattr(data, "nworld", 1))
+    nworld = 1 if self._type is EntityType.REC else nworld_sim
 
     # Store the compiled mj_model so offline methods can use it without compiling child spec.
     self._mj_model = mj_model
-    
+
+    # Helper to adapt world-shaped model tensors to our nworld.
+    def world_view(t: torch.Tensor) -> torch.Tensor:
+      # Expect shape (nworld_sim, ...); slice to nworld rows when needed.
+      if t.shape[0] == nworld:
+        return t
+      # For REC (nworld=1) or when fewer rows requested, take the leading slice
+      return t[:nworld]
+
     # Root state - only for movable entities.
     if not self.is_fixed_base:
       default_root_state = (
@@ -485,8 +496,9 @@ class Entity:
       )[None].repeat(nworld, 1)
 
       if self.is_actuated:
-        default_joint_stiffness = model.actuator_gainprm[:, self.indexing.ctrl_ids, 0]
-        default_joint_damping = -model.actuator_biasprm[:, self.indexing.ctrl_ids, 2]
+        # model.* parameters carry a leading world dimension; adapt to our nworld.
+        default_joint_stiffness = world_view(model.actuator_gainprm[:, self.indexing.ctrl_ids, 0])
+        default_joint_damping = -world_view(model.actuator_biasprm[:, self.indexing.ctrl_ids, 2])
       else:
         default_joint_stiffness = torch.empty(
           nworld, 0, dtype=torch.float, device=device
@@ -495,7 +507,7 @@ class Entity:
 
       # Joint limits and control parameters.
       joint_ids_global = [j.id for j in self._non_free_joints]
-      dof_limits = model.jnt_range[:, joint_ids_global]
+      dof_limits = world_view(model.jnt_range[:, joint_ids_global])
       default_joint_pos_limits = dof_limits.clone()
       joint_pos_limits = default_joint_pos_limits.clone()
       joint_pos_mean = (joint_pos_limits[..., 0] + joint_pos_limits[..., 1]) / 2
@@ -931,7 +943,7 @@ class Entity:
         qpos_i += 1
         qvel_i += 1
       else:
-        raise AssertionError(f"Unsupported joint type {jt} for record joint {name}")
+        raise AssertionError(f"Unsupported joint type {jt}")
 
     rec_qpos = arrays["qpos"]
     rec_qvel = arrays.get("qvel", np.zeros((rec_qpos.shape[0], 0), dtype=np.float32))
@@ -1525,5 +1537,3 @@ def _compute_rest_via_forward_per_frame(
   site_xpos = data.site_xpos[s_ids].astype(np.float32)
   site_xmat = data.site_xmat[s_ids].astype(np.float32)
   return xpos, xquat, cvel, subtree, site_xpos, site_xmat
-
-

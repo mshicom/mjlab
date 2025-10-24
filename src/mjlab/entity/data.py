@@ -33,7 +33,12 @@ def compute_velocity_from_cvel(
 
 @dataclass
 class EntityData:
-  """Data container for an entity."""
+  """Data container for an entity.
+
+  All tensors treat the leading dimension as the batch size (nworld).
+  This class exposes num_envs to reflect the current batch, which can be 1 for
+  offline record playback or env.num_envs for live simulation.
+  """
 
   indexing: EntityIndexing
   data: mjwarp.Data
@@ -65,6 +70,11 @@ class EntityData:
   ROOT_POSE_DIM = POS_DIM + QUAT_DIM  # 7
   ROOT_VEL_DIM = LIN_VEL_DIM + ANG_VEL_DIM  # 6
   ROOT_STATE_DIM = ROOT_POSE_DIM + ROOT_VEL_DIM  # 13
+
+  @property
+  def num_envs(self) -> int:
+    """Number of environments (aka nworld) carried by this data object."""
+    return int(getattr(self.data, "nworld", 1))
 
   def write_root_state(
     self, root_state: torch.Tensor, env_ids: torch.Tensor | slice | None = None
@@ -191,26 +201,22 @@ class EntityData:
 
   @property
   def root_link_pose_w(self) -> torch.Tensor:
-    """Root link pose in simulation world frame. Shape (num_envs, 7)."""
-    pos_w = self.data.xpos[:, self.indexing.root_body_id].clone()  # (num_envs, 3)
-    quat_w = self.data.xquat[:, self.indexing.root_body_id].clone()  # (num_envs, 4)
-    return torch.cat([pos_w, quat_w], dim=-1)  # (num_envs, 7)
+    """Root link pose in simulation world frame. Shape (batch, 7)."""
+    pos_w = self.data.xpos[:, self.indexing.root_body_id].clone()  # (batch, 3)
+    quat_w = self.data.xquat[:, self.indexing.root_body_id].clone()  # (batch, 4)
+    return torch.cat([pos_w, quat_w], dim=-1)  # (batch, 7)
 
   @property
   def root_link_vel_w(self) -> torch.Tensor:
-    """Root link velocity in simulation world frame. Shape (num_envs, 6)."""
-    # NOTE: Equivalently, can read this from qvel[:6] but the angular part
-    # will be in body frame and needs to be rotated to world frame.
-    # Note also that an extra forward() call might be required to make
-    # both values equal.
-    pos = self.data.xpos[:, self.indexing.root_body_id].clone()  # (num_envs, 3)
+    """Root link velocity in simulation world frame. Shape (batch, 6)."""
+    pos = self.data.xpos[:, self.indexing.root_body_id].clone()  # (batch, 3)
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
-    cvel = self.data.cvel[:, self.indexing.root_body_id].clone()  # (num_envs, 6)
-    return compute_velocity_from_cvel(pos, subtree_com, cvel)  # (num_envs, 6)
+    cvel = self.data.cvel[:, self.indexing.root_body_id].clone()  # (batch, 6)
+    return compute_velocity_from_cvel(pos, subtree_com, cvel)  # (batch, 6)
 
   @property
   def root_com_pose_w(self) -> torch.Tensor:
-    """Root center-of-mass pose in simulation world frame. Shape (num_envs, 7)."""
+    """Root center-of-mass pose in simulation world frame. Shape (batch, 7)."""
     pos_w = self.data.xipos[:, self.indexing.root_body_id].clone()
     quat = self.data.xquat[:, self.indexing.root_body_id].clone()
     body_iquat = self.model.body_iquat[:, self.indexing.root_body_id].clone()
@@ -220,34 +226,32 @@ class EntityData:
 
   @property
   def root_com_vel_w(self) -> torch.Tensor:
-    """Root center-of-mass velocity in world frame. Shape (num_envs, 6)."""
-    # NOTE: Equivalent sensor is framelinvel/frameangvel with objtype="body".
-    pos = self.data.xipos[:, self.indexing.root_body_id].clone()  # (num_envs, 3)
+    """Root center-of-mass velocity in world frame. Shape (batch, 6)."""
+    pos = self.data.xipos[:, self.indexing.root_body_id].clone()
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
-    cvel = self.data.cvel[:, self.indexing.root_body_id].clone()  # (num_envs, 6)
-    return compute_velocity_from_cvel(pos, subtree_com, cvel)  # (num_envs, 6)
+    cvel = self.data.cvel[:, self.indexing.root_body_id].clone()
+    return compute_velocity_from_cvel(pos, subtree_com, cvel)
 
   # Body properties
 
   @property
   def body_link_pose_w(self) -> torch.Tensor:
-    """Body link pose in simulation world frame. Shape (num_envs, num_bodies, 7)."""
+    """Body link pose in simulation world frame. Shape (batch, num_bodies, 7)."""
     pos_w = self.data.xpos[:, self.indexing.body_ids].clone()
     quat_w = self.data.xquat[:, self.indexing.body_ids].clone()
     return torch.cat([pos_w, quat_w], dim=-1)
 
   @property
   def body_link_vel_w(self) -> torch.Tensor:
-    """Body link velocity in simulation world frame. Shape (num_envs, num_bodies, 6)."""
-    # NOTE: Equivalent sensor is framelinvel/frameangvel with objtype="xbody".
-    pos = self.data.xpos[:, self.indexing.body_ids].clone()  # (num_envs, num_bodies, 3)
+    """Body link velocity in simulation world frame. Shape (batch, num_bodies, 6)."""
+    pos = self.data.xpos[:, self.indexing.body_ids].clone()
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
     cvel = self.data.cvel[:, self.indexing.body_ids].clone()
     return compute_velocity_from_cvel(pos, subtree_com.unsqueeze(1), cvel)
 
   @property
   def body_com_pose_w(self) -> torch.Tensor:
-    """Body center-of-mass pose in simulation world frame. Shape (num_envs, num_bodies, 7)."""
+    """Body center-of-mass pose in simulation world frame. Shape (batch, num_bodies, 7)."""
     pos_w = self.data.xipos[:, self.indexing.body_ids].clone()
     quat = self.data.xquat[:, self.indexing.body_ids].clone()
     body_iquat = self.model.body_iquat[:, self.indexing.body_ids].clone()
@@ -256,8 +260,7 @@ class EntityData:
 
   @property
   def body_com_vel_w(self) -> torch.Tensor:
-    """Body center-of-mass velocity in simulation world frame. Shape (num_envs, num_bodies, 6)."""
-    # NOTE: Equivalent sensor is framelinvel/frameangvel with objtype="body".
+    """Body center-of-mass velocity in simulation world frame. Shape (batch, num_bodies, 6)."""
     pos = self.data.xipos[:, self.indexing.body_ids].clone()
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
     cvel = self.data.cvel[:, self.indexing.body_ids].clone()
@@ -265,14 +268,14 @@ class EntityData:
 
   @property
   def body_external_wrench(self) -> torch.Tensor:
-    """Body external wrench in world frame. Shape (num_envs, num_bodies, 6)."""
+    """Body external wrench in world frame. Shape (batch, num_bodies, 6)."""
     return self.data.xfrc_applied[:, self.indexing.body_ids].clone()
 
   # Geom properties
 
   @property
   def geom_pose_w(self) -> torch.Tensor:
-    """Geom pose in simulation world frame. Shape (num_envs, num_geoms, 7)."""
+    """Geom pose in simulation world frame. Shape (batch, num_geoms, 7)."""
     pos_w = self.data.geom_xpos[:, self.indexing.geom_ids].clone()
     xmat = self.data.geom_xmat[:, self.indexing.geom_ids].clone()
     quat_w = quat_from_matrix(xmat)
@@ -280,7 +283,7 @@ class EntityData:
 
   @property
   def geom_vel_w(self) -> torch.Tensor:
-    """Geom velocity in simulation world frame. Shape (num_envs, num_geoms, 6)."""
+    """Geom velocity in simulation world frame. Shape (batch, num_geoms, 6)."""
     pos = self.data.geom_xpos[:, self.indexing.geom_ids].clone()
     body_ids = self.model.geom_bodyid[self.indexing.geom_ids].clone()  # (num_geoms,)
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
@@ -289,7 +292,7 @@ class EntityData:
 
   @property
   def site_pose_w(self) -> torch.Tensor:
-    """Site pose in simulation world frame. Shape (num_envs, num_sites, 7)."""
+    """Site pose in simulation world frame. Shape (batch, num_sites, 7)."""
     pos_w = self.data.site_xpos[:, self.indexing.site_ids].clone()
     mat_w = self.data.site_xmat[:, self.indexing.site_ids].clone()
     quat_w = quat_from_matrix(mat_w)
@@ -297,7 +300,7 @@ class EntityData:
 
   @property
   def site_vel_w(self) -> torch.Tensor:
-    """Site velocity in simulation world frame. Shape (num_envs, num_sites, 6)."""
+    """Site velocity in simulation world frame. Shape (batch, num_sites, 6)."""
     pos = self.data.site_xpos[:, self.indexing.site_ids].clone()
     body_ids = self.model.site_bodyid[self.indexing.site_ids].clone()  # (num_sites,)
     subtree_com = self.data.subtree_com[:, self.indexing.root_body_id].clone()
@@ -308,22 +311,22 @@ class EntityData:
 
   @property
   def joint_pos(self) -> torch.Tensor:
-    """Joint positions. Shape (num_envs, nv)"""
+    """Joint positions. Shape (batch, nv)"""
     return self.data.qpos[:, self.indexing.joint_q_adr].clone()
 
   @property
   def joint_vel(self) -> torch.Tensor:
-    """Joint velocities. Shape (num_envs, nv)."""
+    """Joint velocities. Shape (batch, nv)."""
     return self.data.qvel[:, self.indexing.joint_v_adr].clone()
 
   @property
   def joint_acc(self) -> torch.Tensor:
-    """Joint accelerations. Shape (num_envs, nv)."""
+    """Joint accelerations. Shape (batch, nv)."""
     return self.data.qacc[:, self.indexing.joint_v_adr].clone()
 
   @property
   def joint_torques(self) -> torch.Tensor:
-    """Joint torques. Shape (num_envs, nv)."""
+    """Joint torques. Shape (batch, nv)."""
     raise NotImplementedError(
       "Joint torques are not currently available. "
       "Consider using 'actuator_force' property for actuation forces, "
@@ -332,12 +335,12 @@ class EntityData:
 
   @property
   def actuator_force(self) -> torch.Tensor:
-    """Scalar actuation force in actuation space. Shape (num_envs, nu)."""
+    """Scalar actuation force in actuation space. Shape (batch, nu)."""
     return self.data.actuator_force[:, self.indexing.ctrl_ids].clone()
 
   @property
   def generalized_force(self) -> torch.Tensor:
-    """Generalized forces applied to the DoFs. Shape (num_envs, nv)."""
+    """Generalized forces applied to the DoFs. Shape (batch, nv)."""
     return self.data.qfrc_applied[:, self.indexing.free_joint_v_adr].clone()
 
   @property
@@ -346,169 +349,169 @@ class EntityData:
     sensor_data = {}
     for name, indices in self.indexing.sensor_adr.items():
       sensor_data[name] = self.data.sensordata[:, indices].clone()
-    return sensor_data
+      return sensor_data
 
   # Pose and velocity component accessors.
 
   @property
   def root_link_pos_w(self) -> torch.Tensor:
-    """Root link position in world frame. Shape (num_envs, 3)."""
+    """Root link position in world frame. Shape (batch, 3)."""
     return self.root_link_pose_w[:, 0:3]
 
   @property
   def root_link_quat_w(self) -> torch.Tensor:
-    """Root link quaternion in world frame. Shape (num_envs, 4)."""
+    """Root link quaternion in world frame. Shape (batch, 4)."""
     return self.root_link_pose_w[:, 3:7]
 
   @property
   def root_link_lin_vel_w(self) -> torch.Tensor:
-    """Root link linear velocity in world frame. Shape (num_envs, 3)."""
+    """Root link linear velocity in world frame. Shape (batch, 3)."""
     return self.root_link_vel_w[:, 0:3]
 
   @property
   def root_link_ang_vel_w(self) -> torch.Tensor:
-    """Root link angular velocity in world frame. Shape (num_envs, 3)."""
+    """Root link angular velocity in world frame. Shape (batch, 3)."""
     return self.root_link_vel_w[:, 3:6]
 
   @property
   def root_com_pos_w(self) -> torch.Tensor:
-    """Root COM position in world frame. Shape (num_envs, 3)."""
+    """Root COM position in world frame. Shape (batch, 3)."""
     return self.root_com_pose_w[:, 0:3]
 
   @property
   def root_com_quat_w(self) -> torch.Tensor:
-    """Root COM quaternion in world frame. Shape (num_envs, 4)."""
+    """Root COM quaternion in world frame. Shape (batch, 4)."""
     return self.root_com_pose_w[:, 3:7]
 
   @property
   def root_com_lin_vel_w(self) -> torch.Tensor:
-    """Root COM linear velocity in world frame. Shape (num_envs, 3)."""
+    """Root COM linear velocity in world frame. Shape (batch, 3)."""
     return self.root_com_vel_w[:, 0:3]
 
   @property
   def root_com_ang_vel_w(self) -> torch.Tensor:
-    """Root COM angular velocity in world frame. Shape (num_envs, 3)."""
+    """Root COM angular velocity in world frame. Shape (batch, 3)."""
     return self.root_com_vel_w[:, 3:6]
 
   @property
   def body_link_pos_w(self) -> torch.Tensor:
-    """Body link positions in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body link positions in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_link_pose_w[..., 0:3]
 
   @property
   def body_link_quat_w(self) -> torch.Tensor:
-    """Body link quaternions in world frame. Shape (num_envs, num_bodies, 4)."""
+    """Body link quaternions in world frame. Shape (batch, num_bodies, 4)."""
     return self.body_link_pose_w[..., 3:7]
 
   @property
   def body_link_lin_vel_w(self) -> torch.Tensor:
-    """Body link linear velocities in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body link linear velocities in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_link_vel_w[..., 0:3]
 
   @property
   def body_link_ang_vel_w(self) -> torch.Tensor:
-    """Body link angular velocities in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body link angular velocities in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_link_vel_w[..., 3:6]
 
   @property
   def body_com_pos_w(self) -> torch.Tensor:
-    """Body COM positions in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body COM positions in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_com_pose_w[..., 0:3]
 
   @property
   def body_com_quat_w(self) -> torch.Tensor:
-    """Body COM quaternions in world frame. Shape (num_envs, num_bodies, 4)."""
+    """Body COM quaternions in world frame. Shape (batch, num_bodies, 4)."""
     return self.body_com_pose_w[..., 3:7]
 
   @property
   def body_com_lin_vel_w(self) -> torch.Tensor:
-    """Body COM linear velocities in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body COM linear velocities in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_com_vel_w[..., 0:3]
 
   @property
   def body_com_ang_vel_w(self) -> torch.Tensor:
-    """Body COM angular velocities in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body COM angular velocities in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_com_vel_w[..., 3:6]
 
   @property
   def body_external_force(self) -> torch.Tensor:
-    """Body external forces in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body external forces in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_external_wrench[..., 0:3]
 
   @property
   def body_external_torque(self) -> torch.Tensor:
-    """Body external torques in world frame. Shape (num_envs, num_bodies, 3)."""
+    """Body external torques in world frame. Shape (batch, num_bodies, 3)."""
     return self.body_external_wrench[..., 3:6]
 
   @property
   def geom_pos_w(self) -> torch.Tensor:
-    """Geom positions in world frame. Shape (num_envs, num_geoms, 3)."""
+    """Geom positions in world frame. Shape (batch, num_geoms, 3)."""
     return self.geom_pose_w[..., 0:3]
 
   @property
   def geom_quat_w(self) -> torch.Tensor:
-    """Geom quaternions in world frame. Shape (num_envs, num_geoms, 4)."""
+    """Geom quaternions in world frame. Shape (batch, num_geoms, 4)."""
     return self.geom_pose_w[..., 3:7]
 
   @property
   def geom_lin_vel_w(self) -> torch.Tensor:
-    """Geom linear velocities in world frame. Shape (num_envs, num_geoms, 3)."""
+    """Geom linear velocities in world frame. Shape (batch, num_geoms, 3)."""
     return self.geom_vel_w[..., 0:3]
 
   @property
   def geom_ang_vel_w(self) -> torch.Tensor:
-    """Geom angular velocities in world frame. Shape (num_envs, num_geoms, 3)."""
+    """Geom angular velocities in world frame. Shape (batch, num_geoms, 3)."""
     return self.geom_vel_w[..., 3:6]
 
   @property
   def site_pos_w(self) -> torch.Tensor:
-    """Site positions in world frame. Shape (num_envs, num_sites, 3)."""
+    """Site positions in world frame. Shape (batch, num_sites, 3)."""
     return self.site_pose_w[..., 0:3]
 
   @property
   def site_quat_w(self) -> torch.Tensor:
-    """Site quaternions in world frame. Shape (num_envs, num_sites, 4)."""
+    """Site quaternions in world frame. Shape (batch, num_sites, 4)."""
     return self.site_pose_w[..., 3:7]
 
   @property
   def site_lin_vel_w(self) -> torch.Tensor:
-    """Site linear velocities in world frame. Shape (num_envs, num_sites, 3)."""
+    """Site linear velocities in world frame. Shape (batch, num_sites, 3)."""
     return self.site_vel_w[..., 0:3]
 
   @property
   def site_ang_vel_w(self) -> torch.Tensor:
-    """Site angular velocities in world frame. Shape (num_envs, num_sites, 3)."""
+    """Site angular velocities in world frame. Shape (batch, num_sites, 3)."""
     return self.site_vel_w[..., 3:6]
 
   # Derived properties.
 
   @property
   def projected_gravity_b(self) -> torch.Tensor:
-    """Gravity vector projected into body frame. Shape (num_envs, 3)."""
+    """Gravity vector projected into body frame. Shape (batch, 3)."""
     return quat_apply_inverse(self.root_link_quat_w, self.gravity_vec_w)
 
   @property
   def heading_w(self) -> torch.Tensor:
-    """Heading angle in world frame. Shape (num_envs,)."""
+    """Heading angle in world frame. Shape (batch,)."""
     forward_w = quat_apply(self.root_link_quat_w, self.forward_vec_b)
     return torch.atan2(forward_w[:, 1], forward_w[:, 0])
 
   @property
   def root_link_lin_vel_b(self) -> torch.Tensor:
-    """Root link linear velocity in body frame. Shape (num_envs, 3)."""
+    """Root link linear velocity in body frame. Shape (batch, 3)."""
     return quat_apply_inverse(self.root_link_quat_w, self.root_link_lin_vel_w)
 
   @property
   def root_link_ang_vel_b(self) -> torch.Tensor:
-    """Root link angular velocity in body frame. Shape (num_envs, 3)."""
+    """Root link angular velocity in body frame. Shape (batch, 3)."""
     return quat_apply_inverse(self.root_link_quat_w, self.root_link_ang_vel_w)
 
   @property
   def root_com_lin_vel_b(self) -> torch.Tensor:
-    """Root COM linear velocity in body frame. Shape (num_envs, 3)."""
+    """Root COM linear velocity in body frame. Shape (batch, 3)."""
     return quat_apply_inverse(self.root_link_quat_w, self.root_com_lin_vel_w)
 
   @property
   def root_com_ang_vel_b(self) -> torch.Tensor:
-    """Root COM angular velocity in body frame. Shape (num_envs, 3)."""
+    """Root COM angular velocity in body frame. Shape (batch, 3)."""
     return quat_apply_inverse(self.root_link_quat_w, self.root_com_ang_vel_w)
