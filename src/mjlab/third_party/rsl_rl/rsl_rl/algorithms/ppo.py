@@ -203,6 +203,7 @@ class PPO:
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
             
+        extras.setdefault("log", {})
         # AMP intrinsic reward (if configured)
         if self.amp:
             # Extract amp state and update normalization
@@ -211,9 +212,7 @@ class PPO:
             # Compute AMP reward and add to extrinsic reward
             self.amp_reward = self.amp.compute_reward(amp_state)
             self.transition.rewards += self.amp_reward
-            if "episode" not in extras:
-                extras["episode"] = {}
-            extras["episode"]["amp reward"] = self.amp_reward
+            extras["log"]["Episode_Reward/AMP"] = self.amp_reward
 
         # ADD intrinsic reward (if configured)
         if self.add:
@@ -223,9 +222,7 @@ class PPO:
             # Compute ADD reward and add to extrinsic reward
             self.add_reward = self.add.compute_reward(add_state)
             self.transition.rewards += self.add_reward
-            if "episode" not in extras:
-                extras["episode"] = {}
-            extras["episode"]["add reward"] = self.add_reward
+            extras["log"]["Episode_Reward/ADD"] = self.add_reward
 
         # Bootstrapping on time outs
         if "time_outs" in extras:

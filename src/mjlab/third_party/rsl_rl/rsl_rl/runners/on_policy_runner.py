@@ -159,13 +159,13 @@ class OnPolicyRunner:
             # update policy
             loss_dict = self.alg.update()
 
-            # transfer amp/add info from loss_dict to ep_infos for logging
+            # hack: transfer amp/add info from loss_dict to ep_infos for logging
             if self.alg.amp: 
-                ep_infos.append({'amp_agent_logit': loss_dict.pop('amp_agent_logit')})
-                ep_infos.append({'amp_demo_logit': loss_dict.pop('amp_demo_logit')})
+                ep_infos.append({'AMP_D(agent)': loss_dict.pop('amp_agent_logit')})
+                ep_infos.append({'AMP_D(demo)': loss_dict.pop('amp_demo_logit')})
             if self.alg.add:
-                ep_infos.append({'add_pos_logit': loss_dict.pop('add_pos_logit')})
-                ep_infos.append({'add_neg_logit': loss_dict.pop('add_neg_logit')})
+                ep_infos.append({'ADD_D(pos)': loss_dict.pop('add_pos_logit')})
+                ep_infos.append({'ADD_D(neg)': loss_dict.pop('add_neg_logit')})
 
             stop = time.time()
             learn_time = stop - start
@@ -215,8 +215,8 @@ class OnPolicyRunner:
                     infotensors[key].append(value)
                     
             # log to logger and terminal
-            for key, infotensor in infotensors.items():    
-                value = torch.mean(torch.stack(infotensor)).item()  # mean over episodes
+            for key, infotensor in sorted(infotensors.items()):
+                value = torch.mean(torch.stack(infotensor), dtype=torch.float32).item()  # mean over episodes
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
