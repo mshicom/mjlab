@@ -151,13 +151,10 @@ class AMPDiscriminator(nn.Module):
             nn.init.zeros_(self.logits.bias)
         self.bce = nn.BCEWithLogitsLoss()
 
-
-    @cache
     def get_logit_weights(self) -> torch.Tensor:
         """Return flattened weights of the final logit layer for L2 regularization."""
         return self.logits.weight.view(-1)
     
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute discriminator logits.
 
@@ -244,8 +241,8 @@ class AMPDiscriminator(nn.Module):
         demo_logit = self.forward(demo_norm)
 
         # BCEWithLogits losses
-        loss_agent = self.bce(agent_logit, torch.zeros_like(agent_logit))
-        loss_demo  = self.bce(demo_logit,  torch.ones_like(demo_logit))
+        loss_agent = self.bce(agent_logit, torch.zeros_like(agent_logit, device=device))
+        loss_demo  = self.bce(demo_logit,  torch.ones_like(demo_logit, device=device))
         loss = 0.5 * (loss_agent + loss_demo)
 
         # Logit weight L2 regularization
@@ -255,7 +252,7 @@ class AMPDiscriminator(nn.Module):
         grad = torch.autograd.grad(
             demo_logit,
             demo_norm,
-            grad_outputs=torch.ones_like(demo_logit),
+            grad_outputs=torch.ones_like(demo_logit, device=device),
             create_graph=True,
             retain_graph=True,
             only_inputs=True,
@@ -275,7 +272,7 @@ class AMPDiscriminator(nn.Module):
         return {
             "amp_loss": loss,
             "amp_grad_penalty": grad_penalty.detach(),
-            "amp_agent_logit": agent_logit_mean.detach(),      # agent的判别输出，前期接近-1表明判别器学会了判别，后期接近1表明actor成功骗过判别器
+            "amp_agent_logit": agent_logit_mean.detach(),      # agent的判别输出，前期接近0表明判别器学会了判别，后期接近1表明actor成功骗过判别器
             "amp_demo_logit": demo_logit_mean.detach(),        # demo 的判别输出，越接近+1越好
         }
 
