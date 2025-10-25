@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import mujoco
 import numpy as np
@@ -20,6 +20,7 @@ from mjlab.third_party.isaaclab.isaaclab.utils.math import (
   sample_uniform,
   yaw_quat,
 )
+from mjlab.entity.data import compute_velocity_from_cvel  # NEW: for velocities from cvel
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 
 
 class MotionLoader:
+  """File-backed motion loader (.npz) with precomputed sequences."""
   def __init__(
     self, motion_file: str, body_indexes: torch.Tensor, device: str = "cpu"
   ) -> None:
@@ -65,6 +67,86 @@ class MotionLoader:
     return self._body_ang_vel_w[:, self._body_indexes]
 
 
+# NEW: records-backed motion loader
+class MotionLoaderRecords:
+  """Records-backed motion loader built from a REC Entity bound to the robot spec.
+
+  Expects the record entity to have been loaded and initialized. Uses the adapted
+  record arrays (qpos/qvel/xpos/xquat/cvel/subtree_com) to build torch tensors for
+  joint_pos, joint_vel, body_pos_w, body_quat_w, and body (lin/ang) velocities in W.
+  """
+  def __init__(
+    self,
+    rec_entity: "Entity",
+    body_indexes: torch.Tensor,
+    device: str = "cpu",
+  ) -> None:
+    assert getattr(rec_entity, "_rec_arrays", None) is not None, "Record entity has no loaded arrays."
+    arrays = rec_entity._rec_arrays  # type: ignore[attr-defined]
+    # Required arrays
+    qpos = arrays["qpos"]  # (T, 7+J) or (T, J)
+    qvel = arrays["qvel"]  # (T, 6+J) or (T, J)
+    xpos = arrays["xpos"]  # (T, nb, 3)
+    xquat = arrays["xquat"]  # (T, nb, 4)
+    cvel = arrays["cvel"]  # (T, nb, 6)
+    subtree = arrays["subtree_com"]  # (T, nb, 3)
+    # Convert to torch on device
+    device_t = torch.device(device)
+    qpos_t = torch.as_tensor(qpos, dtype=torch.float32, device=device_t)
+    qvel_t = torch.as_tensor(qvel, dtype=torch.float32, device=device_t)
+    xpos_t = torch.as_tensor(xpos, dtype=torch.float32, device=device_t)
+    xquat_t = torch.as_tensor(xquat, dtype=torch.float32, device=device_t)
+    cvel_t = torch.as_tensor(cvel, dtype=torch.float32, device=device_t)
+    subtree_t = torch.as_tensor(subtree, dtype=torch.float32, device=device_t)
+
+    # Joint pos/vel: strip free joint if present (7/6 leading elements)
+    has_free = (qpos_t.shape[1] >= 7) and (qvel_t.shape[1] >= 6)
+    if has_free:
+      joint_pos = qpos_t[:, 7:]
+      joint_vel = qvel_t[:, 6:]
+    else:
+      joint_pos = qpos_t
+      joint_vel = qvel_t
+
+    # Body velocities from cvel (match EntityData.body_link_vel_w logic)
+    # - For body-level velocities, EntityData uses subtree_com of root body for offset.
+    #   Here, subtree_t[:, root_id, :] where root_id==indexing.root_body_id.
+    #   rec_entity.indexing.root_body_id is in global ids; but arrays are entity-local indexed from 0..nb-1.
+    #   By construction, root body for the entity-local arrays is index 0.
+    root_subtree = subtree_t[:, 0, :]  # (T, 3)
+    # Broadcast to (T, nb, 3)
+    root_subtree_b = root_subtree.unsqueeze(1).expand_as(xpos_t)
+    body_vel = compute_velocity_from_cvel(xpos_t, root_subtree_b, cvel_t)  # (T, nb, 6)
+    body_lin_vel_w = body_vel[..., 0:3]
+    body_ang_vel_w = body_vel[..., 3:6]
+
+    # Save and index by body selection
+    self._body_indexes = body_indexes.to(device_t, dtype=torch.long)
+    self.joint_pos = joint_pos  # (T, J)
+    self.joint_vel = joint_vel  # (T, J)
+    self._body_pos_w = xpos_t  # (T, nb, 3)
+    self._body_quat_w = xquat_t  # (T, nb, 4)
+    self._body_lin_vel_w = body_lin_vel_w  # (T, nb, 3)
+    self._body_ang_vel_w = body_ang_vel_w  # (T, nb, 3)
+    self.time_step_total = int(joint_pos.shape[0])
+
+  @property
+  def body_pos_w(self) -> torch.Tensor:
+    return self._body_pos_w[:, self._body_indexes]
+
+  @property
+  def body_quat_w(self) -> torch.Tensor:
+    return self._body_quat_w[:, self._body_indexes]
+
+  @property
+  def body_lin_vel_w(self) -> torch.Tensor:
+    return self._body_lin_vel_w[:, self._body_indexes]
+
+  @property
+  def body_ang_vel_w(self) -> torch.Tensor:
+    return self._body_ang_vel_w[:, self._body_indexes]
+
+
 class MotionCommand(CommandTerm):
   cfg: MotionCommandCfg
   _env: ManagerBasedRlEnv
@@ -83,9 +165,20 @@ class MotionCommand(CommandTerm):
       device=self.device,
     )
 
-    self.motion = MotionLoader(
-      self.cfg.motion_file, self.body_indexes, device=self.device
-    )
+    # Choose loader: records-backed or file-backed.
+    if self.cfg.motion_record is not None:
+      # Load from a record entity present in the scene (SceneCfg.records)
+      rec_name = self.cfg.motion_record
+      rec_ent = self._env.scene[rec_name]
+      assert hasattr(rec_ent, "_rec_arrays"), f"Record entity '{rec_name}' not loaded."
+      self.motion = MotionLoaderRecords(rec_ent, self.body_indexes, device=self.device)
+    else:
+      # Load from motion file (.npz)
+      assert self.cfg.motion_file is not None and len(self.cfg.motion_file) > 0, (
+        "Either 'motion_record' or 'motion_file' must be provided in MotionCommandCfg."
+      )
+      self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
+
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.body_pos_relative_w = torch.zeros(
       self.num_envs, len(cfg.body_names), 3, device=self.device
@@ -428,7 +521,9 @@ class MotionCommand(CommandTerm):
 
 @dataclass(kw_only=True)
 class MotionCommandCfg(CommandTermCfg):
-  motion_file: str
+  # Either provide a file or a record entity name (from SceneCfg.records)
+  motion_file: Optional[str] = None
+  motion_record: Optional[str] = None  # NEW: name of record entity in scene
   anchor_body_name: str
   body_names: list[str]
   asset_name: str

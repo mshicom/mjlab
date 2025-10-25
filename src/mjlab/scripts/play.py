@@ -3,7 +3,7 @@
 from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Optional, cast
 
 import gymnasium as gym
 import torch
@@ -84,6 +84,7 @@ def run_play(
   wandb_run_path: str | None = None,
   checkpoint_file: str | None = None,
   motion_file: str | None = None,
+  motion_record: Optional[str] | None = None,
   num_envs: int | None = None,
   device: str | None = None,
   video: bool = False,
@@ -100,8 +101,9 @@ def run_play(
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
   print(f"[INFO]: Using device: {device}")
 
-  if checkpoint_file is not None and motion_file is None:
-    raise ValueError("Must provide `motion_file` if using `checkpoint_file`.")
+  # When playing from an explicit checkpoint, require at least one motion source.
+  if checkpoint_file is not None and motion_file is None and motion_record is None:
+    raise ValueError("Must provide `motion_file` or `motion_record` if using `checkpoint_file`.")
 
   env_cfg = cast(
     ManagerBasedRlEnvCfg, load_cfg_from_registry(task, "env_cfg_entry_point")
@@ -133,9 +135,17 @@ def run_play(
   log_dir = resume_path.parent
 
   if isinstance(env_cfg, TrackingEnvCfg):
+    # Priority: CLI motion_file -> CLI motion_record -> wandb artifact
     if motion_file is not None:
       print(f"[INFO]: Using motion file from CLI: {motion_file}")
       env_cfg.commands.motion.motion_file = motion_file
+      # Clear record to ensure MotionCommand uses file
+      env_cfg.commands.motion.motion_record = None
+    elif motion_record is not None:
+      print(f"[INFO]: Using motion record from CLI: {motion_record}")
+      env_cfg.commands.motion.motion_record = motion_record
+      # Clear file to ensure MotionCommand uses record
+      env_cfg.commands.motion.motion_file = None
     else:
       import wandb
 
@@ -145,6 +155,7 @@ def run_play(
       if art is None:
         raise RuntimeError("No motion artifact found in the run.")
       env_cfg.commands.motion.motion_file = str(Path(art.download()) / "motion.npz")
+      print(f"[INFO]: Using motion file from wandb artifact: {env_cfg.commands.motion.motion_file}")
 
   env = gym.make(
     task, cfg=env_cfg, device=device, render_mode="rgb_array" if video else None

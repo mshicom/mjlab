@@ -40,7 +40,11 @@ VELOCITY_RANGE = {
 ##
 
 
-SCENE_CFG = SceneCfg(terrain=TerrainImporterCfg(terrain_type="plane"), num_envs=1)
+SCENE_CFG = SceneCfg(
+  terrain=TerrainImporterCfg(terrain_type="plane"), 
+  num_envs=1,
+  records=[],
+)
 
 VIEWER_CONFIG = ViewerConfig(
   origin_type=ViewerConfig.OriginType.ASSET_BODY,
@@ -71,6 +75,7 @@ class CommandsCfg:
     joint_position_range=(-0.1, 0.1),
     # Override in robot cfg.
     motion_file="",
+    motion_record="stepinplace1",
     anchor_body_name="",
     body_names=[],
   )

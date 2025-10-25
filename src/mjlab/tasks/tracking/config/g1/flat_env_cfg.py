@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_ACTION_SCALE, G1_ROBOT_CFG
 from mjlab.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 from mjlab.utils.spec_config import ContactSensorCfg
+from mjlab.scene import RecordCfg
 
 
 @dataclass
@@ -52,6 +53,13 @@ class G1FlatEnvCfg(TrackingEnvCfg):
     ]
 
     self.viewer.body_name = "torso_link"
+    
+    self.scene.records = [
+      RecordCfg(
+        path="/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz",
+        source_xml="/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml"
+      ),
+    ]
 
 
 @dataclass

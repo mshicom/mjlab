@@ -124,28 +124,34 @@ def run_train(task: str, cfg: TrainConfig) -> None:
   log_root_path.mkdir(parents=True, exist_ok=True)
 
   if isinstance(cfg.env, TrackingEnvCfg):
-    if not cfg.registry_name:
-      raise ValueError("Must provide --registry-name for tracking tasks.")
+    # If the MotionCommand is configured to use a scene record (motion_record), skip artifact download.
+    use_motion_record = getattr(cfg.env.commands.motion, "motion_record", None)
+    if not use_motion_record:
+      # Fall back to artifact-backed motion_file workflow.
+      if not cfg.registry_name:
+        raise ValueError("Must provide --registry-name for tracking tasks when 'motion_record' is not set in the env config.")
+      # Check if the registry name includes alias, if not, append ':latest'.
+      registry_name = cast(str, cfg.registry_name)
+      if ":" not in registry_name:
+        registry_name = registry_name + ":latest"
+      motion_marker = log_root_path / ".motion_file"
+      if ctx.is_main_process and motion_marker.exists():
+        motion_marker.unlink()
 
-    # Check if the registry name includes alias, if not, append ":latest".
-    registry_name = cast(str, cfg.registry_name)
-    if ":" not in registry_name:
-      registry_name = registry_name + ":latest"
-    motion_marker = log_root_path / ".motion_file"
-    if ctx.is_main_process and motion_marker.exists():
-      motion_marker.unlink()
+      if ctx.is_main_process:
+        import wandb
 
-    if ctx.is_main_process:
-      import wandb
-
-      api = wandb.Api()
-      artifact = api.artifact(registry_name)
-      motion_path = Path(artifact.download()) / "motion.npz"
-      cfg.env.commands.motion.motion_file = str(motion_path)
-      motion_marker.write_text(motion_path.as_posix())
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_path = Path(artifact.download()) / "motion.npz"
+        cfg.env.commands.motion.motion_file = str(motion_path)
+        motion_marker.write_text(motion_path.as_posix())
+        print(f"[INFO] Using motion_file from artifact: {motion_path}")
+      else:
+        wait_for_path_update(motion_marker, timeout=120)
+        cfg.env.commands.motion.motion_file = motion_marker.read_text().strip()
     else:
-      wait_for_path_update(motion_marker, timeout=120)
-      cfg.env.commands.motion.motion_file = motion_marker.read_text().strip()
+      print(f"[INFO] Using motion_record='{use_motion_record}' from SceneCfg.records; skipping artifact download.")
 
   run_name_suffix = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   if cfg.agent.run_name:
