@@ -8,9 +8,10 @@ from typing import Callable, Dict, Optional, Tuple, Any
 
 import torch
 from torch import nn
+from torch import autograd
 
 from rsl_rl.networks.normalization import EmpiricalNormalization
-from functools import cache
+
 
 @dataclass
 class AMPConfig:
@@ -19,16 +20,17 @@ class AMPConfig:
     This configuration governs both the network architecture and all loss and
     reward-shaping terms. It is modeled after MimicKit's AMP settings:
       - BCE classification of agent vs. demo states.
+      - Optional Wasserstein-like loss with gradient penalty.
       - L2 regularization on the final logit layer.
-      - Gradient penalty on the demo inputs.
+      - Gradient penalty on the demo inputs (BCE) or mixed inputs (Wasserstein).
       - Optional manual weight decay on all discriminator weights.
-      - Reward shaping: r = -log(max(1 - sigmoid(logit), 1e-4)) * scale.
+      - Reward shaping:
+          * BCE: r = -log(max(1 - sigmoid(logit), eps)) * scale,
+          * Wasserstein: r = exp(tanh(eta * logit)) * scale.
 
-    Critical math/technical details matched from MimicKit:
-      - Loss = 0.5*(BCE(agent, 0) + BCE(demo, 1)) + λ_logit||W_logit||^2
-               + λ_gp E[||∂D/∂x_demo||^2] + λ_wd Σ||W_l||^2.
-      - Reward uses probability p = sigmoid(logit): r = -log(max(1 - p, 1e-4)) * reward_scale.
-      - Normalization: empirical running mean/std computed over agent and demo states.
+    Critical math/technical details matched from the amp-rsl-rl example discriminator:
+      - Wasserstein loss uses tanh(eta * D(x)) both for reward and loss stabilization.
+      - Wasserstein gradient penalty uses interpolation between expert and policy with ||∇D||_2 penalty to target 1.
     """
     enabled: bool = False
     '''Whether to enable AMP training. Default is False.'''
@@ -54,20 +56,25 @@ class AMPConfig:
     '''Discriminator optimizer learning rate. Uses Adam optimizer.'''
     
     disc_loss_coef: float = 5.0
+    '''Global scaling coefficient applied to the discriminator loss (for stability/weighting).'''
 
     logit_reg: float = 0.01
     '''Coefficient for L2 penalty on the final logit layer weights ||W_logit||^2.'''
 
     grad_penalty: float = 5.0
-    '''Coefficient for gradient penalty on demo inputs: E[ ||∂D/∂x_demo||^2 ].
-    Implemented exactly as in MimicKit (_compute_disc_loss).'''
+    '''Coefficient for gradient penalty:
+       - BCE: E[ ||∂D/∂x_demo||^2 ].
+       - Wasserstein: E[ (||∇D(α x_demo + (1-α) x_agent)||_2 - 1)^2 ].'''
 
     disc_weight_decay: float = 0.0001
-    '''Manual L2 penalty coefficient on all discriminator weights Σ||W||^2.
-    This matches MimicKit's "disc_weight_decay" which is separate from optimizer weight_decay.'''
+    '''Manual L2 penalty coefficient on all discriminator weights Σ||W||^2 (if applied in loss).
+    Typically optimizer weight_decay is preferred; keep 0 here if you set optimizer weight decay.'''
 
     reward_scale: float = 1.0
-    '''Scale for the AMP reward r_amp = -log(max(1 - sigmoid(logit), 1e-4)) * reward_scale.'''
+    '''Scale for the AMP reward.'''
+
+    reward_clamp_epsilon: float = 1e-4
+    '''Epsilon used to clamp arguments to log in BCE-style rewards: -log(max(1 - p, eps)).'''
 
     eval_batch_size: int = 0
     '''Optional chunk size for reward evaluation to control memory.
@@ -86,6 +93,12 @@ class AMPConfig:
     '''Ratio determining how many demo samples to draw relative to current agent batch size:
     n_demo = max(1, int(n_agent * demo_batch_ratio)).'''
 
+    loss_type: str = "Wasserstein"
+    '''Discriminator loss type: "BCEWithLogits" (default) or "Wasserstein".'''
+
+    eta_wgan: float = 0.3
+    '''Scaling factor applied inside tanh for Wasserstein-like stabilization per amp-rsl-rl example.'''
+
 
 def _activation(name: str) -> nn.Module:
     lname = name.lower()
@@ -101,22 +114,22 @@ def _activation(name: str) -> nn.Module:
 
 
 class AMPDiscriminator(nn.Module):
-    """Adversarial Motion Prior discriminator.
+    """Adversarial Motion Prior discriminator with optional Wasserstein-like loss.
 
     This module contains:
       - An empirical normalizer over AMP state features (EmpiricalNormalization).
       - A small MLP backbone and a linear logit head (scalar output).
       - Methods to compute:
-          * Reward: r = -log(max(1 - sigmoid(logit), 1e-4)) * reward_scale.
-          * Loss: BCE agent vs. demo, logit L2 reg, demo grad penalty, manual weight decay.
+          * Reward:
+              - BCE: r = -log(max(1 - sigmoid(logit), eps)) * reward_scale.
+              - Wasserstein: r = exp(tanh(eta * logit)) * reward_scale.
+          * Loss:
+              - BCE: 0.5*(BCE(agent,0) + BCE(demo,1)) + logit L2 + demo grad penalty (+ optional manual WD).
+              - Wasserstein: mean(tanh(eta)*D(agent)) - mean(tanh(eta)*D(demo)) + WGAN grad penalty
+                using interpolated inputs and target 1-norm, plus optional logit L2 and manual WD.
       - Utilities for chunked reward evaluation and extracting AMP state from obs.
 
-    All math and operations mirror MimicKit's AMPAgent/AMPModel design:
-      - BCEWithLogitsLoss with targets 0/1.
-      - Logit weight L2 regularization over the final linear layer only (logit_reg).
-      - Gradient penalty computed on demo inputs with torch.autograd.grad.
-      - Manual weight decay over all Linear layer weights (disc_weight_decay).
-      - Reward computed from sigmoid(logits) and using an epsilon clamp of 1e-4.
+    The Wasserstein formulation follows the reference amp-rsl-rl discriminator implementation.
     """
 
     def __init__(self, amp_cfg: AMPConfig, amp_state_shape: torch.Size, device: str = "cpu"):
@@ -149,7 +162,8 @@ class AMPDiscriminator(nn.Module):
         if amp_cfg.init_output_scale != 0.0:
             nn.init.uniform_(self.logits.weight, -amp_cfg.init_output_scale, amp_cfg.init_output_scale)
             nn.init.zeros_(self.logits.bias)
-        self.bce = nn.BCEWithLogitsLoss()
+        # BCE loss if needed
+        self.bce = nn.BCEWithLogitsLoss() if self.cfg.loss_type == "BCEWithLogits" else None
 
     def get_logit_weights(self) -> torch.Tensor:
         """Return flattened weights of the final logit layer for L2 regularization."""
@@ -171,62 +185,68 @@ class AMPDiscriminator(nn.Module):
     def compute_reward(self, amp_state: torch.Tensor,*, detach: bool = True) -> torch.Tensor:
         """Compute AMP reward for given raw amp_state batch.
 
-        reward = -log(max(1 - sigmoid(logit), 1e-4)) * reward_scale.
+        - BCE: r = -log(max(1 - sigmoid(logit), eps)) * reward_scale
+        - Wasserstein: r = exp(tanh(eta * logit)) * reward_scale
 
         Notes:
           - Uses EmpiricalNormalization for inputs (normalizer parameters are updated elsewhere).
-          - Mirrors MimicKit's _calc_disc_rewards exactly (including clamp 1e-4 epsilon).
+          - Mirrors amp-rsl-rl example for Wasserstein reward path.
         """
         with torch.set_grad_enabled(not detach):
-            # Normalize inputs
             x = self.state_norm(amp_state)
-            # Optionally chunk to reduce memory
             if self.cfg.eval_batch_size and self.cfg.eval_batch_size > 0 and x.shape[0] > self.cfg.eval_batch_size:
                 rewards = []
                 bs = self.cfg.eval_batch_size
                 for i in range(0, x.shape[0], bs):
                     logits = self.forward(x[i : i + bs])
-                    prob = torch.sigmoid(logits)
-                    r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))
-                    rewards.append(r * self.cfg.reward_scale)
+                    rewards.append(self._reward_from_logits(logits))
                 return torch.cat(rewards, dim=0)
             
-            # process all at once
-            logits = self.forward(x)
+            else:
+                logits = self.forward(x)
+                return self._reward_from_logits(logits)
+
+    def _reward_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Internal helper to map logits to rewards depending on loss_type."""
+        if self.cfg.loss_type == "Wasserstein":
+            # Per amp-rsl-rl example: tanh(eta * D) then exp() then scale
+            d = torch.tanh(self.cfg.eta_wgan * logits)
+            r = torch.exp(d)
+        else:
             prob = torch.sigmoid(logits)
-            # 以D(actor)逼近1的程度为奖励（r=小数点后几位, 1=1e-1, 2=1e-2，最大4=1e-4）
-            r = -torch.log(torch.clamp(1.0 - prob, min=1e-4))   
-            r = r * self.cfg.reward_scale
-            return r
+            r = -torch.log(torch.clamp(1.0 - prob, min=self.cfg.reward_clamp_epsilon))
+        return r * self.cfg.reward_scale
 
     @torch.no_grad()
     def update_normalization(self, amp_state: torch.Tensor):
         """Update empirical normalization with a batch of raw amp_state."""
         self.state_norm.update(amp_state)
 
-
     def compute_loss(self, agent_state: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute discriminator losses using agent vs. demo batches.
 
-        Mirrors MimicKit (AMPAgent._compute_disc_loss) with:
+        BCE path mirrors MimicKit (AMPAgent._compute_disc_loss):
           - BCEWithLogitsLoss targeting 0 for agent logits, 1 for demo logits.
           - Average the two losses.
           - Add L2 penalty on final logit weights (logit_reg).
           - Add gradient penalty on demo inputs grad_penalty * E[||∂D/∂x_demo||^2].
-          - Add weight decay disc_weight_decay * Σ||W||^2 across all Linear weights (by optimizer)
+
+        Wasserstein path mirrors amp-rsl-rl design:
+          - amp_loss = mean(tanh(eta)*D(agent)) - mean(tanh(eta)*D(demo))
+          - Gradient penalty on interpolated inputs: (||∇D(α demo + (1-α) agent)||_2 - 1)^2.
+          - Optional logit L2 regularization.
+          - check the underlying math at https://zhuanlan.zhihu.com/p/388486502
 
         Additionally:
-          - Updates normalization statistics for both agent and demo inputs before evaluating loss, as in MimicKit
-            (they record both agent and demo observations before updating normalizer).
+          - Updates normalization statistics for both agent and demo inputs before evaluating loss.
         """
         device = agent_state.device
         B = agent_state.shape[0]
-        n_demo = max(1, int(B * float(self.cfg.demo_batch_ratio)))
-
-        # Sample demo batch
-        demo_state = self.cfg.demo_provider(n_demo, device=device)
         
-        # Update normalization (recording step, mirrors MimicKit behavior)
+        # Sample demo batch
+        demo_state = self.cfg.demo_provider(B, device=device)
+        
+        # Update normalization (recording step)
         with torch.no_grad():
             self.state_norm.update(agent_state)
             self.state_norm.update(demo_state)
@@ -234,47 +254,87 @@ class AMPDiscriminator(nn.Module):
         # Normalize inputs
         agent_norm = self.state_norm(agent_state)
         demo_norm = self.state_norm(demo_state)
-        demo_norm.requires_grad_(True)
 
-        # Logits
-        agent_logit = self.forward(agent_norm)
-        demo_logit = self.forward(demo_norm)
+        if self.cfg.loss_type == "Wasserstein":
+            # Forward raw logits
+            agent_logit = self.forward(agent_norm)
+            demo_logit  = self.forward(demo_norm)
 
-        # BCEWithLogits losses
-        loss_agent = self.bce(agent_logit, torch.zeros_like(agent_logit, device=device))
-        loss_demo  = self.bce(demo_logit,  torch.ones_like(demo_logit, device=device))
-        loss = 0.5 * (loss_agent + loss_demo)
+            # WGAN-like loss with tanh stabilization
+            agent_w = torch.tanh(self.cfg.eta_wgan * agent_logit)
+            demo_w  = torch.tanh(self.cfg.eta_wgan * demo_logit)
+            amp_loss = agent_w.mean() - demo_w.mean()
 
-        # Logit weight L2 regularization
-        loss += self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
+            # Gradient penalty on interpolated samples (target unit norm), WGAN-GP
+            alpha = torch.rand(demo_norm.size(0), 1, device=device)
+            # Expand alpha across feature dimension
+            alpha = alpha.expand_as(demo_norm)
+            mixed = alpha * demo_norm + (1.0 - alpha) * agent_norm
+            mixed.requires_grad_(True)
+            scores = self.forward(mixed)
+            grad = autograd.grad(
+                outputs=scores,
+                inputs=mixed,
+                grad_outputs=torch.ones_like(scores),
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+            # GP term: (||grad||_2 - 1)^2
+            gp = ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
+            loss = amp_loss + self.cfg.grad_penalty * gp
 
-        # Gradient penalty on demo inputs: E[||∂D/∂x_demo||^2]
-        grad = torch.autograd.grad(
-            demo_logit,
-            demo_norm,
-            grad_outputs=torch.ones_like(demo_logit, device=device),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        # Sum of squared grads over feature dimension, mean over batch
-        grad_sq = torch.sum(grad * grad, dim=-1)
-        grad_penalty = torch.mean(grad_sq)
-        loss += self.cfg.grad_penalty * grad_penalty
+            # Logit L2 regularization
+            if self.cfg.logit_reg != 0.0:
+                loss = loss + self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
 
-        # overall scaling
-        loss *= self.cfg.disc_loss_coef
-        
-        # Means of logits (for diagnostics)
-        agent_logit_mean = agent_logit.mean()
-        demo_logit_mean  = demo_logit.mean()
+            # Scaling
+            loss = loss * self.cfg.disc_loss_coef
 
-        return {
-            "amp_loss": loss,
-            "amp_grad_penalty": grad_penalty.detach(),
-            "amp_agent_logit": agent_logit_mean.detach(),      # agent的判别输出，前期接近0表明判别器学会了判别，后期接近1表明actor成功骗过判别器
-            "amp_demo_logit": demo_logit_mean.detach(),        # demo 的判别输出，越接近+1越好
-        }
+            return {
+                "amp_loss": loss,
+                "amp_grad_penalty": gp.detach(),
+                "amp_agent_logit": agent_w.mean().detach(),
+                "amp_demo_logit": demo_w.mean().detach(),
+            }
+            
+        else:
+            # ----------------- BCE PATH -----------------
+            demo_norm.requires_grad_(True)
+            agent_logit = self.forward(agent_norm)
+            demo_logit  = self.forward(demo_norm)
+
+            # BCEWithLogits losses
+            assert self.bce is not None, "BCE loss requested but BCE criterion is None"
+            loss_agent = self.bce(agent_logit, torch.zeros_like(agent_logit, device=device))
+            loss_demo  = self.bce(demo_logit,  torch.ones_like(demo_logit,  device=device))
+            loss = 0.5 * (loss_agent + loss_demo)
+
+            # Logit weight L2 regularization
+            loss = loss + self.cfg.logit_reg * torch.sum(self.get_logit_weights() ** 2)
+
+            # Gradient penalty on demo inputs: E[||∂D/∂x_demo||^2]
+            grad = autograd.grad(
+                demo_logit,
+                demo_norm,
+                grad_outputs=torch.ones_like(demo_logit, device=device),
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+            grad_sq = torch.sum(grad * grad, dim=-1)
+            grad_penalty = torch.mean(grad_sq)
+            loss = loss + self.cfg.grad_penalty * grad_penalty
+
+            # overall scaling
+            loss = loss * self.cfg.disc_loss_coef
+            
+            return {
+                "amp_loss": loss,
+                "amp_grad_penalty": grad_penalty.detach(),
+                "amp_agent_logit": torch.sigmoid(agent_logit).mean().detach(),
+                "amp_demo_logit":  torch.sigmoid(demo_logit).mean().detach(),
+            }
 
 
     def extract_state_from_obs(self, obs: object) -> torch.Tensor:

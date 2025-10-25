@@ -406,7 +406,8 @@ class PPO:
             # AMP discriminator loss (NEW)
             if self.amp:
                 # Compute AMP loss on original batch only (no duplicates from augmentation)
-                amp_obs = obs_batch[:original_batch_size]
+                B = max(1, int(original_batch_size *  self.amp.cfg.demo_batch_ratio))
+                amp_obs = obs_batch[:B]
                 amp_state_batch = self.amp.extract_state_from_obs(amp_obs)
                 amp_loss_dict = self.amp.compute_loss(amp_state_batch)
 

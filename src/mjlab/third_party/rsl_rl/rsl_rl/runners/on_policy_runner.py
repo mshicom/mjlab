@@ -335,34 +335,33 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        try:
-            # -- Load RND model if used
-            if hasattr(self.alg, "rnd") and self.alg.rnd:
-                self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
-            # -- Load AMP discriminator if used (NEW)
-            if hasattr(self.alg, "amp") and self.alg.amp:
-                self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
-            # -- Load ADD discriminator if used (NEW)
-            if hasattr(self.alg, "add") and self.alg.add:
-                self.alg.add.load_state_dict(loaded_dict["add_state_dict"])
-        except KeyError:
-            pass
+        # -- Load RND model if used
+        if hasattr(self.alg, "rnd") and self.alg.rnd and "rnd_state_dict" in loaded_dict:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load AMP discriminator if used (NEW)
+        if hasattr(self.alg, "amp") and self.alg.amp and "amp_state_dict" in loaded_dict:
+            try: self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+            except Exception as e: print(f"Error loading AMP state dict: {e}")
+        # -- Load ADD discriminator if used (NEW)
+        if hasattr(self.alg, "add") and self.alg.add and "add_state_dict" in loaded_dict:
+            try: self.alg.add.load_state_dict(loaded_dict["add_state_dict"])
+            except Exception as e: print(f"Error loading ADD state dict: {e}")
+
         # -- load optimizer if used
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            try:
-                # -- RND optimizer if used
-                if hasattr(self.alg, "rnd") and self.alg.rnd:
-                    self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
-                # -- AMP optimizer if used
-                if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer:
-                    self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
-                # -- ADD optimizer if used
-                if hasattr(self.alg, "add_optimizer") and self.alg.add_optimizer:
-                    self.alg.add_optimizer.load_state_dict(loaded_dict["add_optimizer_state_dict"])
-            except KeyError:
-                pass
+            self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
+            # -- RND optimizer if used
+            if hasattr(self.alg, "rnd") and self.alg.rnd and "rnd_optimizer_state_dict" in loaded_dict:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+            # -- AMP optimizer if used
+            if hasattr(self.alg, "amp_optimizer") and self.alg.amp_optimizer and "amp_optimizer_state_dict" in loaded_dict:
+                self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+            # -- ADD optimizer if used
+            if hasattr(self.alg, "add_optimizer") and self.alg.add_optimizer and "add_optimizer_state_dict" in loaded_dict:
+                self.alg.add_optimizer.load_state_dict(loaded_dict["add_optimizer_state_dict"])
+
         # -- load current learning iteration
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]

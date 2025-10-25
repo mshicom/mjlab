@@ -42,10 +42,11 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.events.foot_friction.params["asset_cfg"].geom_names = geom_names
     self.actions.joint_pos.scale = G1_ACTION_SCALE
     
-    self.rewards.feet_slide.params["sensor_names"] = sensor_names
-    self.rewards.feet_slide.params["asset_cfg"].geom_names = ["left_foot1_collision", "right_foot1_collision" ]
+    # self.rewards.feet_slide.params["sensor_names"] = sensor_names
+    # self.rewards.feet_slide.params["asset_cfg"].geom_names = ["left_foot1_collision", "right_foot1_collision" ]
+    # self.rewards.feet_slide.weight = 0
     
-    self.rewards.air_time.params["sensor_names"] = sensor_names
+    # self.rewards.air_time.params["sensor_names"] = sensor_names
 
     self.rewards.pose.params["std"] = {
       # Lower body.
@@ -78,16 +79,22 @@ class UnitreeG1RoughEnvCfg(LocomotionVelocityEnvCfg):
     self.amp_demo.enabled = True
     self.scene.records = [
       RecordCfg(
-        path="/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/stepinplace1.npz",
+        path="/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/walk.npz",
+        source_xml="/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml"
+      ),
+      RecordCfg(
+        path="/workspaces/ws_rl/data/loco-mujoco-datasets/DefaultDatasets/mocap/UnitreeG1/onestepside1.npz",
         source_xml="/workspaces/ws_rl/src/loco-mujoco/loco_mujoco/models/unitree_g1/g1_23dof.xml"
       ),
     ]
     
     # disable all other rewards for pure amp test
-    if 1:
+    if 0:
       cfg_items = get_terms(self.rewards, RewardTermCfg).items()
       for term_name, term_cfg in cfg_items:
-          term_cfg.weight = 0.
+        if term_name in ["feet_slide"]:
+          continue
+        term_cfg.weight = 0.
 
     
 

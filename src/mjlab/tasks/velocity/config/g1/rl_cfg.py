@@ -37,7 +37,7 @@ class UnitreeG1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
       amp_cfg=RslRlPpoAmpCfg(
         enabled=False,
         obs_key="amp_state",
-        demo_batch_ratio=0.1,
+        demo_batch_ratio=1,
         reward_scale=1.0,
         disc_loss_coef=5.0,
         hidden_dims=(1024, 256),
@@ -50,11 +50,13 @@ class UnitreeG1PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         norm_until=None,
         eval_batch_size=0,
         init_output_scale=1.0,
+        loss_type="Wasserstein",
+        eta_wgan=0.3,
       )
       
     )
   )
   experiment_name: str = "g1_velocity"
-  save_interval: int = 50
+  save_interval: int = 300
   num_steps_per_env: int = 24
   max_iterations: int = 30_000

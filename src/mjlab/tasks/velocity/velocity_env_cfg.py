@@ -146,9 +146,12 @@ class ObservationCfg:
       hist_func=mdp.aggregate_cat,
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=[
-          r".*",
-          # r".*hip.*",
-          # r".*knee.*",
+          # r".*",
+          r".*shoulder.*",
+          r".*waist.*",
+          r".*elbow.*",
+          r".*hip.*",
+          r".*knee.*",
           # r".*ankle.*",
         ]),   # can be overrided in robot cfg.
       }
@@ -252,30 +255,30 @@ class RewardCfg:
   dof_pos_limits: RewardTerm = term(RewardTerm, func=mdp.joint_pos_limits, weight=-1.0)
   action_rate_l2: RewardTerm = term(RewardTerm, func=mdp.action_rate_l2, weight=-0.1)
 
-  air_time: RewardTerm = term(
-    RewardTerm,
-    func=mdp.feet_air_time,
-    weight=0.01,
-    params={
-      "asset_name": "robot",
-      "threshold_min": 0.05,
-      "threshold_max": 0.15,
-      "command_name": "twist",
-      "command_threshold": 0.05,
-      "sensor_names": [],
-      "reward_mode": "on_landing",
-    },
-  )
+  # air_time: RewardTerm = term(
+  #   RewardTerm,
+  #   func=mdp.feet_air_time,
+  #   weight=0.01,
+  #   params={
+  #     "asset_name": "robot",
+  #     "threshold_min": 0.05,
+  #     "threshold_max": 0.15,
+  #     "command_name": "twist",
+  #     "command_threshold": 0.05,
+  #     "sensor_names": [],
+  #     "reward_mode": "on_landing",
+  #   },
+  # )
   
-  feet_slide: RewardTerm = term(
-    RewardTerm,
-    func=mdp.feet_slide,
-    weight=-0.25,
-    params={
-        "asset_cfg": SceneEntityCfg("robot", geom_names=[]),  # Override in robot cfg.
-        "sensor_names": [],  # Override in robot cfg.
-    },
-  )
+  # feet_slide: RewardTerm = term(
+  #   RewardTerm,
+  #   func=mdp.feet_slide,
+  #   weight=-0.25,
+  #   params={
+  #       "asset_cfg": SceneEntityCfg("robot", geom_names=[]),  # Override in robot cfg.
+  #       "sensor_names": [],  # Override in robot cfg.
+  #   },
+  # )
   
 
 
