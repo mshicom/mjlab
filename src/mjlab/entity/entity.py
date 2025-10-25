@@ -998,7 +998,7 @@ class Entity:
         if not tb_map:
           return mat  # assume already aligned
         i = tb_map.get(name, None)
-        return mat[:, i:i+1, :] if i is not None else np.zeros((T, 1, width), dtype=np.float32)
+        return mat[:, i:i+1, :] if (i is not None) and mat.size > 0 else np.zeros((T, 1, width), dtype=np.float32)
       xpos_list, xquat_list, cvel_list, subtree_list = [], [], [], []
       if tb_map:
         for bn in self.body_names:
